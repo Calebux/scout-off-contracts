@@ -15,7 +15,7 @@ use types::{
 };
 
 pub use errors::ScoutChainError;
-pub use types::{MigrationAuthorization, MigrationRole};
+pub use types::{MigrationAuthorization, MigrationRole, ScoutStatus};
 // `PlayerVitals` is an *input* type of the public `register_player` function, so
 // it must be nameable by external callers (integration tests, generated
 // clients). Re-export it at the crate root; this also brings it into local
@@ -481,6 +481,43 @@ impl RegistrationContract {
             .persistent()
             .remove(&DataKey::PlayerDeactivated(player_id));
         events::player_reactivated(&env, player_id, &admin);
+        Ok(())
+    }
+
+    /// Deactivate a scout (admin only).
+    ///
+    /// Sets a `ScoutDeactivated(scout_id)` flag that causes `get_scout_status`
+    /// to return `Deactivated`. The on-chain profile is fully preserved and
+    /// still accessible via `get_scout`.
+    pub fn deactivate_scout(env: Env, scout_id: u64) -> Result<(), ScoutChainError> {
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        // Ensure the scout actually exists before setting the flag.
+        let exists = env.storage().persistent().has(&DataKey::Scout(scout_id));
+        if !exists {
+            return Err(ScoutChainError::ScoutNotFound);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ScoutDeactivated(scout_id), &true);
+        events::scout_deactivated(&env, scout_id, &admin);
+        Ok(())
+    }
+
+    /// Reactivate a previously deactivated scout (admin only).
+    ///
+    /// Clears the `ScoutDeactivated(scout_id)` flag, making the scout
+    /// active again.
+    pub fn reactivate_scout(env: Env, scout_id: u64) -> Result<(), ScoutChainError> {
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        // Ensure the scout actually exists.
+        let exists = env.storage().persistent().has(&DataKey::Scout(scout_id));
+        if !exists {
+            return Err(ScoutChainError::ScoutNotFound);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ScoutDeactivated(scout_id));
+        events::scout_reactivated(&env, scout_id, &admin);
         Ok(())
     }
 
@@ -1074,6 +1111,21 @@ impl RegistrationContract {
         } else {
             ScoutStatus::Active
         }
+    }
+
+    /// Check whether a scout has been deactivated by admin.
+    ///
+    /// Returns `true` if the scout exists and has the `ScoutDeactivated` flag set.
+    /// Returns `false` if the scout does not exist or is active.
+    pub fn is_scout_deactivated(env: Env, scout_id: u64) -> bool {
+        let exists = env.storage().persistent().has(&DataKey::Scout(scout_id));
+        if !exists {
+            return false;
+        }
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::ScoutDeactivated(scout_id))
+            .unwrap_or(false)
     }
 
     pub fn get_scout(env: Env, scout_id: u64) -> Result<ScoutProfile, ScoutChainError> {
