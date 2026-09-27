@@ -462,9 +462,25 @@ impl RegistrationContract {
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         // Ensure the player actually exists before setting the flag.
         Self::load_stored_player(&env, player_id)?;
+        // Idempotency: if already deactivated, return silently without a
+        // duplicate event (prevents polluting the indexer event history).
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PlayerDeactivated(player_id))
+        {
+            return Ok(());
+        }
         env.storage()
             .persistent()
             .set(&DataKey::PlayerDeactivated(player_id), &true);
+        // Extend TTL so the flag is not silently archived and the player
+        // does not reappear in discovery results.
+        env.storage().persistent().extend_ttl(
+            &DataKey::PlayerDeactivated(player_id),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
         events::player_deactivated(&env, player_id, &admin);
         Ok(())
     }
@@ -477,6 +493,15 @@ impl RegistrationContract {
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         // Ensure the player actually exists.
         Self::load_stored_player(&env, player_id)?;
+        // Idempotency: if not currently deactivated, return silently without
+        // a duplicate event.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::PlayerDeactivated(player_id))
+        {
+            return Ok(());
+        }
         env.storage()
             .persistent()
             .remove(&DataKey::PlayerDeactivated(player_id));
@@ -3848,5 +3873,66 @@ mod tests {
         let record = client.get_scout_verification(&scout_id);
         assert!(record.verified);
         assert!(record.verified_by.is_some());
+    }
+
+    // -------------------------------------------------------------------------
+    // deactivate_player / reactivate_player idempotency tests (#1446)
+    // -------------------------------------------------------------------------
+
+    /// Calling deactivate_player twice must not emit a second event; the second
+    /// call returns Ok(()) silently.
+    #[test]
+    fn test_deactivate_player_idempotent() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let vitals = dummy_vitals(&env);
+        let hashes = vec![&env, String::from_str(&env, "QmHash1")];
+        let player_id = client.register_player(&wallet, &vitals, &hashes);
+
+        // First deactivation — should succeed and record an event.
+        client.deactivate_player(&player_id);
+        let events_after_first = env.events().all();
+        let count_after_first = events_after_first.len();
+
+        // Second deactivation — must be a no-op (no new event).
+        client.deactivate_player(&player_id);
+        let events_after_second = env.events().all();
+        assert_eq!(
+            events_after_second.len(),
+            count_after_first,
+            "second deactivate_player must not emit a duplicate event"
+        );
+    }
+
+    /// Calling reactivate_player on a player that is not deactivated must not
+    /// emit an event; the call returns Ok(()) silently.
+    #[test]
+    fn test_reactivate_player_idempotent() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let vitals = dummy_vitals(&env);
+        let hashes = vec![&env, String::from_str(&env, "QmHash2")];
+        let player_id = client.register_player(&wallet, &vitals, &hashes);
+
+        // Deactivate first, then reactivate.
+        client.deactivate_player(&player_id);
+        client.reactivate_player(&player_id);
+        let events_after_reactivate = env.events().all();
+        let count_after_reactivate = events_after_reactivate.len();
+
+        // Second reactivation on an already-active player must be a no-op.
+        client.reactivate_player(&player_id);
+        let events_after_second = env.events().all();
+        assert_eq!(
+            events_after_second.len(),
+            count_after_reactivate,
+            "second reactivate_player must not emit a duplicate event"
+        );
     }
 }
