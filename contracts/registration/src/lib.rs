@@ -92,6 +92,8 @@ impl RegistrationContract {
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage().instance().set(&DataKey::PlayerCounter, &0u64);
         env.storage().instance().set(&DataKey::ScoutCounter, &0u64);
+        env.storage().instance().set(&DataKey::LivePlayerCount, &0u64);
+        env.storage().instance().set(&DataKey::LiveScoutCount, &0u64);
         Ok(())
     }
 
@@ -322,6 +324,9 @@ impl RegistrationContract {
         );
         Self::level_index_add(&env, &ProgressLevel::Unverified, player_id);
 
+        // Increment live player count
+        Self::increment_live_player_count(&env)?;
+
         events::player_registered(&env, player_id, &wallet);
         Ok(player_id)
     }
@@ -376,6 +381,17 @@ impl RegistrationContract {
 
         // Remove from composite index
         Self::composite_index_remove(&env, &level, &profile.vitals.region, player_id);
+        Self::level_index_remove(&env, &level, player_id);
+
+        // Decrement live player count (saturating to avoid underflow)
+        let live: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LivePlayerCount)
+            .unwrap_or(0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::LivePlayerCount, &live.saturating_sub(1));
 
         events::player_deregistered(&env, player_id, &admin);
         Ok(())
@@ -459,6 +475,9 @@ impl RegistrationContract {
             .persistent()
             .set(&DataKey::ScoutByWallet(wallet.clone()), &scout_id);
 
+        // Increment live scout count
+        Self::increment_live_scout_count(&env)?;
+
         events::scout_registered(&env, scout_id, &wallet);
         Ok(scout_id)
     }
@@ -521,13 +540,19 @@ impl RegistrationContract {
             .persistent()
             .get(&DataKey::PlayerIndex)
             .unwrap_or_else(|| Vec::new(&env));
-        if !player_ids.iter().any(|id| id == player_id) {
+        let is_new_player = !player_ids.iter().any(|id| id == player_id);
+        if is_new_player {
             player_ids.push_back(player_id);
             env.storage().persistent().set(&DataKey::PlayerIndex, &player_ids);
         }
 
         Self::composite_index_add(&env, &level, &stored.vitals.region, player_id);
         Self::level_index_add(&env, &level, player_id);
+
+        // Increment live player count only for new entries
+        if is_new_player {
+            Self::increment_live_player_count(&env)?;
+        }
 
         events::player_registered(&env, player_id, &wallet);
         Ok(player_id)
@@ -562,6 +587,9 @@ impl RegistrationContract {
         env.storage()
             .persistent()
             .set(&DataKey::ScoutByWallet(wallet.clone()), &scout_id);
+
+        // Increment live scout count
+        Self::increment_live_scout_count(&env)?;
 
         events::scout_registered(&env, scout_id, &wallet);
         Ok(scout_id)
@@ -655,6 +683,12 @@ impl RegistrationContract {
         Ok(())
     }
 
+    /// Return the number of currently registered players.
+    ///
+    /// This is a live count: it increments on `register_player` /
+    /// `admin_seed_player` and decrements on `deregister_player`, so it
+    /// always reflects the actual number of active player profiles rather
+    /// than the monotonically-increasing `PlayerCounter` ID allocator.
     pub fn get_player_count(env: Env) -> u64 {
         if !env
             .storage()
@@ -666,10 +700,15 @@ impl RegistrationContract {
         }
         env.storage()
             .instance()
-            .get(&DataKey::PlayerCounter)
+            .get(&DataKey::LivePlayerCount)
             .unwrap_or(0u64)
     }
 
+    /// Return the number of currently registered scouts.
+    ///
+    /// This is a live count: it increments on `register_scout` /
+    /// `admin_seed_scout` and remains stable on deactivation, so it
+    /// reflects registered scout profiles rather than the ID allocator.
     pub fn get_scout_count(env: Env) -> u64 {
         if !env
             .storage()
@@ -681,7 +720,7 @@ impl RegistrationContract {
         }
         env.storage()
             .instance()
-            .get(&DataKey::ScoutCounter)
+            .get(&DataKey::LiveScoutCount)
             .unwrap_or(0u64)
     }
 
@@ -949,6 +988,30 @@ impl RegistrationContract {
         let next = id.checked_add(1).ok_or(ScoutChainError::Overflow)?;
         env.storage().instance().set(&DataKey::ScoutCounter, &next);
         Ok(next)
+    }
+
+    /// Increment the O(1) live player counter (checked to prevent overflow).
+    fn increment_live_player_count(env: &Env) -> Result<(), ScoutChainError> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LivePlayerCount)
+            .unwrap_or(0u64);
+        let next = count.checked_add(1).ok_or(ScoutChainError::Overflow)?;
+        env.storage().instance().set(&DataKey::LivePlayerCount, &next);
+        Ok(())
+    }
+
+    /// Increment the O(1) live scout counter (checked to prevent overflow).
+    fn increment_live_scout_count(env: &Env) -> Result<(), ScoutChainError> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LiveScoutCount)
+            .unwrap_or(0u64);
+        let next = count.checked_add(1).ok_or(ScoutChainError::Overflow)?;
+        env.storage().instance().set(&DataKey::LiveScoutCount, &next);
+        Ok(())
     }
 
     fn level_gte(level: &ProgressLevel, min_level: &ProgressLevel) -> bool {
