@@ -42,6 +42,27 @@ That keeps the command copy-paste-runnable in a standard `bash`/`zsh` shell.
 
 ---
 
+## Pagination convention
+
+All paginated getter functions across the four contracts follow a
+consistent convention:
+
+| Parameter | Convention |
+|-----------|-----------|
+| `limit`   | Clamped to **1..=50**. A `limit` of `0` is treated as `1` (or returns `InvalidInput` for functions that return `Result`). |
+| `offset`  | Zero-based item offset into the result set. |
+| `next_cursor` / `total` | Returned so callers know when paging is complete. |
+
+Functions following this convention:
+- `registration::filter_players` — `limit` clamped to 1..=50; returns `InvalidInput` for `limit = 0`
+- `scout_access::get_scout_contacts_page` — `limit` clamped to 1..=50
+- `verification::list_disputes_page` — `limit` clamped to 1..=50
+- `verification::get_global_milestone_index` — `limit` clamped to 1..=50
+- `verification::get_validator_milestones_page_v2` — `limit` clamped to 1..=50
+- `progress::get_progress_history_page` — `limit` clamped to 1..=50 (already correct)
+
+---
+
 ## registration
 
 Handles player and scout on-chain identity: registration, profile updates,
@@ -496,6 +517,13 @@ Pagination:
 - `next_cursor` = 0 in the response means no further results.
 - Both `offset` and `next_cursor` are *counts* of eligible (non-deactivated,
   filter-matching) entries, not player IDs.
+- `limit` is clamped to 1..=50 internally. A `limit` of 0 returns
+  `InvalidInput`.
+- `FilterResult.has_more` is `true` when additional pages exist after the
+  current one. Use `has_more` (not `next_cursor != 0`) to decide whether to
+  continue paging, because `next_cursor` is a raw offset value that could
+  theoretically be non-zero even when no more entries remain if the underlying
+  data changed between pages.
 
 > **Past bug (#1017):** `next_cursor` used to be set to the raw `player_id` of
 > the last entry on the page while `offset` was always compared as a count of

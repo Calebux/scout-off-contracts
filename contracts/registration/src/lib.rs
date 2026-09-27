@@ -1223,7 +1223,7 @@ impl RegistrationContract {
     /// - `offset` = 0 starts from the beginning; pass the previously returned
     ///   `next_cursor` value as `offset` to fetch the next page.
     ///   `next_cursor` = 0 in the response means no further results.
-    /// - `limit` is capped at 50 internally.
+    /// - `limit` is clamped to 1..=50 internally.
     /// - Deactivated players (those with a `PlayerDeactivated` flag) are excluded
     ///   from results. Their profiles are still accessible via `get_player`.
     ///
@@ -1237,6 +1237,11 @@ impl RegistrationContract {
     /// used so only matching buckets are loaded.  When `region` is empty the
     /// function falls back to a full `PlayerIndex` scan filtered by level and
     /// position.
+    ///
+    /// **Pagination loop**: call with `offset = 0, limit = N` for the first
+    /// page.  For each subsequent page pass the `next_cursor` from the
+    /// previous response as `offset`.  Stop when `has_more` is `false` or
+    /// `next_cursor` is `0`.
     pub fn filter_players(
         env: Env,
         region: String,
@@ -1247,6 +1252,9 @@ impl RegistrationContract {
     ) -> Result<FilterResult, ScoutChainError> {
         Self::require_initialized(&env)?;
 
+        if limit == 0 {
+            return Err(ScoutChainError::InvalidInput);
+        }
         let max_results = limit.min(50);
         let region_filter = !region.is_empty();
         let position_filter = !position.is_empty();
@@ -1345,6 +1353,7 @@ impl RegistrationContract {
         Ok(FilterResult {
             profiles: results,
             next_cursor,
+            has_more: next_cursor != 0,
         })
     }
 

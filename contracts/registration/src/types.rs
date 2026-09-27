@@ -114,6 +114,11 @@ pub struct FilterResult {
     /// Pass this value as `offset` in the next call to continue pagination.
     /// A value of `0` means there are no further results.
     pub next_cursor: u64,
+    /// Whether more results exist after this page.
+    /// When `false`, the client has reached the end of the result set
+    /// and should stop paging even if `next_cursor` is non-zero
+    /// (which can happen if the underlying data changed between pages).
+    pub has_more: bool,
 }
 
 /// Direct status for a registered player.

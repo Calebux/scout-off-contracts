@@ -2205,9 +2205,9 @@ impl VerificationContract {
     /// disputes — no full scan is required at query time.
     ///
     /// **Pagination**: `offset` is a zero-based item offset into the index;
-    /// `limit` is capped at 50 per page, matching the established pagination
-    /// convention used by `get_global_milestone_index` and
-    /// `get_validator_milestones_page`.
+    /// `limit` is clamped to 1..=50 per page. A `limit` of 0 is treated
+    /// as 1. This matches the convention used by `get_global_milestone_index`,
+    /// `get_validator_milestones_page_v2`, and `get_scout_contacts_page`.
     ///
     /// **Ordering**: entries are returned in insertion order (oldest first).
     pub fn list_disputes_page(env: Env, offset: u32, limit: u32) -> Vec<(u64, u32)> {
@@ -2218,7 +2218,7 @@ impl VerificationContract {
             .unwrap_or_else(|| Vec::new(&env));
 
         let total = open_index.len();
-        let cap = limit.min(50);
+        let cap = if limit == 0 { 1 } else { limit.min(50) };
         let mut page: Vec<(u64, u32)> = Vec::new(&env);
         let mut i = offset;
         while i < total && page.len() < cap {
@@ -2228,6 +2228,20 @@ impl VerificationContract {
         page
     }
 
+    /// Return a bounded, paginated page of the global milestone index.
+    ///
+    /// The underlying ring buffer (`DataKey::GlobalMilestoneSlot`) holds
+    /// the most recent `MAX_GLOBAL_MILESTONE_INDEX` entries.  Older
+    /// entries are evicted in FIFO order.
+    ///
+    /// **Pagination**: `offset` is a zero-based item offset into the
+    /// ring buffer; `limit` is clamped to 1..=50 per page. A `limit`
+    /// of 0 is treated as 1. This matches the convention used by
+    /// `list_disputes_page`, `get_validator_milestones_page_v2`, and
+    /// `get_scout_contacts_page`.
+    ///
+    /// **Ordering**: entries are returned in insertion order (oldest
+    /// first).
     pub fn get_global_milestone_index(
         env: Env,
         offset: u32,
@@ -2257,7 +2271,7 @@ impl VerificationContract {
 
         let cap = MAX_GLOBAL_MILESTONE_INDEX;
         let live_count = write_head.min(cap);
-        let page_cap = limit.min(50);
+        let page_cap = if limit == 0 { 1 } else { limit.min(50) };
 
         let mut entries = Vec::new(&env);
 
@@ -2333,7 +2347,7 @@ impl VerificationContract {
 
     /// Return a bounded page of milestones approved by `wallet`.
     ///
-    /// `limit` is capped at 50 entries, matching `get_global_milestone_index`.
+    /// `limit` is clamped to 1..=50 entries, matching `get_global_milestone_index`.
     ///
     /// > **Deprecated**: use [`get_validator_milestones_page_v2`] which returns a
     /// [`MilestoneRefPage`] with a `total` field so callers know when to stop paging.
@@ -2357,7 +2371,7 @@ impl VerificationContract {
         }
 
         let mut page = Vec::new(&env);
-        let cap = if limit > 50 { 50 } else { limit };
+        let cap = if limit == 0 { 1 } else { limit.min(50) };
         let mut i = offset;
         while i < list.len() && page.len() < cap {
             page.push_back(list.get(i).unwrap());
@@ -2375,8 +2389,10 @@ impl VerificationContract {
     /// lets a client know exactly when paging is complete without over-fetching.
     ///
     /// **Pagination**: `offset` is a zero-based item offset into the validator's
-    /// milestone list.  `limit` is capped at 50 entries per page, matching the
-    /// convention used by `get_global_milestone_index` and `list_disputes_page`.
+    /// milestone list.  `limit` is clamped to 1..=50 per page. A `limit`
+    /// of 0 is treated as 1. This matches the convention used by
+    /// `get_global_milestone_index`, `list_disputes_page`, and
+    /// `get_scout_contacts_page`.
     ///
     /// **Ordering**: entries are returned in approval order (oldest first),
     /// exactly as they appear in `ValidatorMilestones` storage.
@@ -2399,7 +2415,7 @@ impl VerificationContract {
         }
 
         let total = list.len();
-        let cap = limit.min(50);
+        let cap = if limit == 0 { 1 } else { limit.min(50) };
         let mut entries = Vec::new(&env);
         let mut i = offset;
         while i < total && entries.len() < cap {
@@ -2449,7 +2465,7 @@ impl VerificationContract {
             .unwrap_or_else(|| Vec::new(&env));
 
         let total = list.len();
-        let cap = limit.min(50);
+        let cap = if limit == 0 { 1 } else { limit.min(50) };
         let mut entries = Vec::new(&env);
         let mut i = offset;
         while i < total && entries.len() < cap {
