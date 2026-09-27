@@ -90,20 +90,34 @@ where
 
 /// Validate that a string is a plausible IPFS/Arweave CID.
 ///
-/// Rules:
-/// - CIDv0: starts with "Qm", exactly 46 characters, base58btc charset
-///   (no 0, O, I, l characters).
-/// - CIDv1 (base32): starts with "bafy", 59–128 characters.
+/// Accepted forms:
+/// - **CIDv0**: starts with `"Qm"`, exactly 46 characters, base58btc charset
+///   (digits 1–9, upper A–Z except I/O, lower a–z except l).
+/// - **CIDv1 base32**: starts with `"baf"` (multibase prefix `b` followed by
+///   base32-encoded version=1 varint and codec varint). This covers all common
+///   codecs: `bafy` (dag-pb, 0x70), `bafk` (raw, 0x55), `bafyr` (dag-cbor,
+///   0x71), `bagu` (dag-json, 0x0129), etc. Length must be 59–128 characters
+///   and only RFC 4648 lowercase base32 characters (a–z, 2–7) are accepted.
+///
+/// This is a lightweight format sanity check, not a full CID decoder — it does
+/// not parse the multibase prefix, multicodec, or multihash the way a real CID
+/// library would. Any CID that passes this check but is still malformed will
+/// simply fail to resolve against the downstream IPFS/Arweave gateway, which
+/// acts as the real source of truth for CID validity. This function only needs
+/// to catch obviously wrong input (wrong prefix, wrong length, or bytes outside
+/// the expected alphabet — e.g. whitespace or control characters), not
+/// guarantee byte-for-byte correctness.
 pub fn validate_cid(hash: &String) -> Result<(), &'static str> {
     let hash_len = hash.len();
     let bytes = hash.to_bytes();
 
     let starts_with_qm = bytes.get(0) == Some(b'Q') && bytes.get(1) == Some(b'm');
-    let starts_with_bafy = hash_len >= 4
+    // Accept any CIDv1 base32 starting with "baf" — covers bafy (dag-pb),
+    // bafk (raw), bafyr (dag-cbor), bagu (dag-json) and future codecs.
+    let starts_with_baf = hash_len >= 3
         && bytes.get(0) == Some(b'b')
         && bytes.get(1) == Some(b'a')
-        && bytes.get(2) == Some(b'f')
-        && bytes.get(3) == Some(b'y');
+        && bytes.get(2) == Some(b'f');
 
     if starts_with_qm {
         // CIDv0: exactly 46 chars
@@ -122,17 +136,9 @@ pub fn validate_cid(hash: &String) -> Result<(), &'static str> {
             }
         }
         Ok(())
-    } else if starts_with_bafy {
+    } else if starts_with_baf {
         // CIDv1 (base32): 59–128 chars, RFC4648 lowercase base32 charset
-        // (a–z, 2–7). This is a lightweight format sanity check, not a full
-        // CID decoder — it does not parse the multibase prefix, multicodec,
-        // or multihash the way a real CID library would. Any CID that
-        // passes this check but is still malformed will simply fail to
-        // resolve against the downstream IPFS/Arweave gateway, which acts
-        // as the real source of truth for CID validity. This function only
-        // needs to catch obviously wrong input (wrong prefix, wrong length,
-        // or bytes outside the expected alphabet — e.g. whitespace or
-        // control characters), not guarantee byte-for-byte correctness.
+        // (a–z, 2–7).
         if !(59..=128).contains(&hash_len) {
             return Err("invalid cid: CIDv1 must be 59–128 characters");
         }
@@ -146,7 +152,7 @@ pub fn validate_cid(hash: &String) -> Result<(), &'static str> {
         }
         Ok(())
     } else {
-        Err("invalid cid: must start with 'Qm' (CIDv0) or 'bafy' (CIDv1)")
+        Err("invalid cid: must start with 'Qm' (CIDv0) or 'baf' (CIDv1 base32)")
     }
 }
 
@@ -238,6 +244,36 @@ mod tests {
     fn test_validate_cid_rejects_bad_prefix() {
         let env = Env::default();
         let cid = s(&env, "XmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB");
+        assert!(validate_cid(&cid).is_err());
+    }
+
+    #[test]
+    fn test_validate_cid_v1_bafk_raw_codec_accepted() {
+        let env = Env::default();
+        // Real bafkrei CID (raw codec, 0x55) — 59 chars, valid base32
+        let cid = s(
+            &env,
+            "bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku",
+        );
+        assert!(validate_cid(&cid).is_ok());
+    }
+
+    #[test]
+    fn test_validate_cid_v1_bafy_still_accepted() {
+        let env = Env::default();
+        // dag-pb CID (bafy prefix) still works after broadening to baf
+        let cid = s(
+            &env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
+        assert!(validate_cid(&cid).is_ok());
+    }
+
+    #[test]
+    fn test_validate_cid_v1_rejects_unknown_base_prefix() {
+        let env = Env::default();
+        // 'z' multibase (base58btc) — not a CIDv0 (no Qm) and not base32 (baf)
+        let cid = s(&env, "zdj7WgYnAMFGPMT7eaZMcFr3BzURoW1KYJdH6EBtEaHJQ");
         assert!(validate_cid(&cid).is_err());
     }
 }
