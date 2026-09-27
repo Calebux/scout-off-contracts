@@ -1,10 +1,8 @@
 -- ScoutChain — initial PostgreSQL schema
 -- Run by the backend on first startup or via a migration tool (e.g. node-pg-migrate)
 --
--- Known gap: validator deactivation status is not tracked here; active/inactive
--- state must be managed in the application layer until a migration is added.
--- Known gap: validator deactivation status resolved in #837 — active BOOLEAN
--- column added to validators table below.
+-- Note: validator deactivation status is tracked via the `active` BOOLEAN column
+-- in the `validators` table below (see #837).
 
 -- -----------------------------------------------------------------------
 -- Players
