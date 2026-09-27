@@ -88,6 +88,63 @@ where
     Ok(admin)
 }
 
+/// Write a cross-contract wiring link into instance storage with epoch tracking.
+///
+/// Each call increments a monotonic epoch counter stored alongside the address
+/// so off-chain indexers can detect re-wiring events and correlate them with the
+/// contract address in effect at each point in time.
+///
+/// # Overflow policy
+///
+/// The epoch is a `u32` incremented with [`u32::saturating_add`].  With
+/// `overflow-checks = true` in the release profile, a plain `epoch + 1` would
+/// **trap** on the 4,294,967,296th re-wiring — practically unreachable, but
+/// inconsistent with this codebase's overflow policy (see `[profile.release]`
+/// in `Cargo.toml`).  `saturating_add` saturates at `u32::MAX` rather than
+/// trapping.
+///
+/// # Parameters
+///
+/// - `env`         — the current contract execution environment.
+/// - `address_key` — instance-storage key under which the address is stored.
+/// - `epoch_key`   — instance-storage key under which the epoch counter is stored.
+/// - `new_address` — the contract address to write.
+///
+/// # Usage
+///
+/// ```ignore
+/// use scoutchain_shared_types::write_wiring_link;
+///
+/// write_wiring_link(
+///     &env,
+///     &DataKey::ProgressContract,
+///     &DataKey::ProgressContractEpoch,
+///     &progress_contract_address,
+/// );
+/// ```
+pub fn write_wiring_link<K>(
+    env: &Env,
+    address_key: &K,
+    epoch_key: &K,
+    new_address: &Address,
+)
+where
+    K: IntoVal<Env, soroban_sdk::Val>,
+{
+    // Read current epoch (0 on first wiring).
+    let current_epoch: u32 = env
+        .storage()
+        .instance()
+        .get(epoch_key)
+        .unwrap_or(0u32);
+
+    // Increment with saturating_add to avoid trapping at u32::MAX.
+    let next_epoch = current_epoch.saturating_add(1);
+
+    env.storage().instance().set(address_key, new_address);
+    env.storage().instance().set(epoch_key, &next_epoch);
+}
+
 /// Validate that a string is a plausible IPFS/Arweave CID.
 ///
 /// Rules:
@@ -168,9 +225,64 @@ fn is_base32_char(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::testutils::Address as _;
 
     fn s(env: &Env, v: &str) -> String {
         String::from_str(env, v)
+    }
+
+    // ── write_wiring_link tests (#1466) ───────────────────────────────────────
+
+    /// First wiring: epoch starts at 0, advances to 1.
+    #[test]
+    fn test_write_wiring_link_first_call_sets_epoch_to_one() {
+        let env = Env::default();
+        let addr = Address::generate(&env);
+
+        write_wiring_link(&env, &1u32, &2u32, &addr);
+
+        let stored_addr: Address = env.storage().instance().get(&1u32).unwrap();
+        let stored_epoch: u32 = env.storage().instance().get(&2u32).unwrap();
+
+        assert_eq!(stored_addr, addr);
+        assert_eq!(stored_epoch, 1u32);
+    }
+
+    /// Re-wiring increments the epoch and updates the address.
+    #[test]
+    fn test_write_wiring_link_increments_epoch_on_rewiring() {
+        let env = Env::default();
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+
+        write_wiring_link(&env, &1u32, &2u32, &addr1);
+        write_wiring_link(&env, &1u32, &2u32, &addr2);
+
+        let stored_addr: Address = env.storage().instance().get(&1u32).unwrap();
+        let stored_epoch: u32 = env.storage().instance().get(&2u32).unwrap();
+
+        assert_eq!(stored_addr, addr2);
+        assert_eq!(stored_epoch, 2u32);
+    }
+
+    /// Boundary: epoch at u32::MAX must saturate, not trap (issue #1466).
+    #[test]
+    fn test_write_wiring_link_saturates_at_u32_max_epoch() {
+        let env = Env::default();
+
+        // Seed the epoch key at u32::MAX.
+        env.storage().instance().set(&2u32, &u32::MAX);
+
+        let addr = Address::generate(&env);
+        // saturating_add(1) keeps epoch at u32::MAX — must not trap.
+        write_wiring_link(&env, &1u32, &2u32, &addr);
+
+        let stored_epoch: u32 = env.storage().instance().get(&2u32).unwrap();
+        assert_eq!(stored_epoch, u32::MAX,
+            "epoch must saturate at u32::MAX, not overflow or trap");
+        let stored_addr: Address = env.storage().instance().get(&1u32).unwrap();
+        assert_eq!(stored_addr, addr,
+            "address must still be updated at boundary epoch");
     }
 
     #[test]
