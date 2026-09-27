@@ -141,4 +141,13 @@ pub enum DataKey {
     /// (push on creation) and `confirm_trial_offer` (remove on cleanup) so
     /// `expire_trial_offers` can sweep stale escrows without an off-chain index.
     OutstandingTrialEscrows,
+    /// Idempotency marker written after a trial offer is successfully confirmed:
+    /// (player_id, index) → bool.
+    ///
+    /// `confirm_trial_offer` checks this key before executing the escrow
+    /// release and returns `Ok(())` immediately on a retry, without
+    /// re-running the escrow release or the progress-contract call. The key
+    /// is scoped to `(player_id, index)` so a confirmation for one offer
+    /// cannot no-op a confirmation for a different offer.
+    TrialOfferConfirmed(u64, u32),
 }

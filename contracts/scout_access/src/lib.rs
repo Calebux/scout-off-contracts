@@ -832,6 +832,18 @@ impl ScoutAccessContract {
         // Player must authorize
         player_wallet.require_auth();
 
+        // Idempotency: if this offer was already confirmed, return Ok(()) without
+        // re-executing the escrow release or the progress-contract call.
+        // The key is scoped to (player_id, index) so a confirmation for one
+        // offer cannot no-op a confirmation for a different offer.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TrialOfferConfirmed(player_id, index))
+        {
+            return Ok(());
+        }
+
         // Load escrow record
         let escrow: TrialEscrow = env
             .storage()
@@ -903,6 +915,17 @@ impl ScoutAccessContract {
         Self::remove_from_outstanding_trial_escrows(&env, player_id, index);
         // Emit confirmed event
         events::trial_offer_confirmed(&env, player_id, &offer.scout, index);
+
+        // Persist the scoped idempotency marker so subsequent retries of this
+        // exact (player_id, index) pair return Ok(()) without re-executing.
+        env.storage()
+            .persistent()
+            .set(&DataKey::TrialOfferConfirmed(player_id, index), &true);
+        env.storage().persistent().extend_ttl(
+            &DataKey::TrialOfferConfirmed(player_id, index),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
         Ok(())
     }
 
@@ -2646,6 +2669,67 @@ mod tests {
         assert!(result.is_ok());
         let stored = client.get_fee_config();
         assert_eq!(stored.contact_fee_stroops, 200_000);
+    }
+
+    // -------------------------------------------------------------------------
+    // ConfirmationNonce / confirm_trial_offer idempotency tests (#1420)
+    // -------------------------------------------------------------------------
+
+    /// Calling confirm_trial_offer on an already-confirmed offer (where the
+    /// TrialOfferConfirmed marker has been set directly) must return Ok(())
+    /// without attempting to load the escrow or call the progress contract.
+    #[test]
+    fn test_confirm_trial_offer_idempotent_when_marker_set() {
+        let (env, admin, xlm, contract_id, client) = setup();
+        let player_wallet = Address::generate(&env);
+
+        // Inject the TrialOfferConfirmed marker directly into persistent
+        // storage — simulating a previously completed confirmation.
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::TrialOfferConfirmed(1u64, 0u32), &true);
+        });
+
+        // confirm_trial_offer should return Ok(()) because the marker is set,
+        // even though there is no TrialEscrow record.
+        let _ = (admin, xlm); // suppress unused-variable warnings
+        let result = client.try_confirm_trial_offer(&player_wallet, &1u64, &0u32);
+        assert!(
+            result.is_ok(),
+            "Expected Ok(()) on retry of already-confirmed offer, got {:?}",
+            result
+        );
+    }
+
+    /// Confirming offer (player_id=1, index=0) must not suppress confirmation
+    /// of a different offer (player_id=2, index=0). Each key is scoped
+    /// independently.
+    #[test]
+    fn test_confirmation_marker_scoped_to_player_and_index() {
+        let (env, admin, xlm, contract_id, client) = setup();
+        let player_wallet = Address::generate(&env);
+
+        // Set marker for player 1 / index 0 only.
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::TrialOfferConfirmed(1u64, 0u32), &true);
+        });
+
+        // player 1 / index 0 → idempotent Ok(())
+        let _ = (admin, xlm);
+        let res1 = client.try_confirm_trial_offer(&player_wallet, &1u64, &0u32);
+        assert!(res1.is_ok(), "player 1 index 0 should be idempotent");
+
+        // player 2 / index 0 → NOT marked; escrow absent → TrialOfferAlreadyConfirmed
+        // (absence of TrialEscrow returns that error, NOT the idempotency Ok path)
+        let res2 = client.try_confirm_trial_offer(&player_wallet, &2u64, &0u32);
+        assert_eq!(
+            res2,
+            Err(Ok(ScoutAccessError::TrialOfferAlreadyConfirmed)),
+            "player 2 index 0 should not be no-op'd by player 1's marker"
+        );
     }
 
     // -------------------------------------------------------------------------
