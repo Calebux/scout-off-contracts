@@ -1,7 +1,7 @@
 #![allow(deprecated, dead_code)]
-use soroban_sdk::{Address, Env, Symbol};
+use soroban_sdk::{Address, Env, String, Symbol};
 
-use crate::types::MigrationRole;
+use crate::types::{MigrationRole, ProgressLevel};
 
 pub const PLAYER_REGISTERED: &str = "player_registered";
 pub const SCOUT_REGISTERED: &str = "scout_registered";
@@ -81,11 +81,17 @@ pub fn profile_updated(env: &Env, player_id: u64, wallet: &Address) {
     );
 }
 
-/// topics: (event_name, admin)  data: player_id
-pub fn player_deregistered(env: &Env, player_id: u64, admin: &Address) {
+/// topics: (event_name, admin)  data: (player_id, level, region)
+pub fn player_deregistered(
+    env: &Env,
+    player_id: u64,
+    level: &ProgressLevel,
+    region: &String,
+    admin: &Address,
+) {
     env.events().publish(
         (Symbol::new(env, "player_deregistered"), admin.clone()),
-        player_id,
+        (player_id, level.clone(), region.clone()),
     );
 }
 

@@ -421,8 +421,16 @@ impl RegistrationContract {
     pub fn deregister_player(env: Env, player_id: u64) -> Result<(), ScoutChainError> {
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         let profile = Self::load_stored_player(&env, player_id)?;
-        // Resolve level before removing storage keys (progress contract is source of truth)
-        let level = Self::resolve_level(&env, player_id);
+        // Read stored level directly — do NOT use resolve_level (which falls
+        // back to a cross-contract call that could differ from the bucket the
+        // player is actually indexed under).
+        let level: ProgressLevel = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlayerLevel(player_id))
+            .unwrap_or(ProgressLevel::Unverified);
+        let region = profile.vitals.region.clone();
+
         env.storage()
             .persistent()
             .remove(&DataKey::Player(player_id));
@@ -446,10 +454,23 @@ impl RegistrationContract {
                 .set(&DataKey::PlayerIndex, &player_ids);
         }
 
-        // Remove from composite index
-        Self::composite_index_remove(&env, &level, &profile.vitals.region, player_id);
+        // Remove from level-only index (PlayersByLevel)
+        Self::level_index_remove(&env, &level, player_id);
 
-        events::player_deregistered(&env, player_id, &admin);
+        // Remove from composite (level, region) index (PlayersByLevelRegion)
+        Self::composite_index_remove(&env, &level, &region, player_id);
+
+        // Clear any deactivation flag so a future re-registration or id-reuse
+        // does not inherit a stale deactivated status.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PlayerDeactivated(player_id));
+
+        // PlayerRegLastSent is intentionally preserved so that a rapid
+        // re-registration from the same wallet is still subject to the
+        // per-wallet cooldown.
+
+        events::player_deregistered(&env, player_id, &level, &region, &admin);
         Ok(())
     }
 
@@ -3354,6 +3375,169 @@ mod tests {
         // deregister_player and verify_scout are admin-only and must bypass the pause.
         assert_eq!(client.try_deregister_player(&player_id), Ok(Ok(())));
         assert_eq!(client.try_verify_scout(&scout_id), Ok(Ok(())));
+    }
+
+    /// After deregistering a player, all four index buckets, the composite
+    /// bucket, and the deactivation flag must be clean — no stale references.
+    #[test]
+    fn test_deregister_player_cleans_all_indexes() {
+        use soroban_sdk::testutils::storage::Persistent as _;
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let vitals = PlayerVitals {
+            age: 20,
+            position: String::from_str(&env, "Forward"),
+            region: String::from_str(&env, "West Africa"),
+            nationality: String::from_str(&env, "Ghana"),
+        };
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+
+        let player_id = client.register_player(&wallet, &vitals, &hashes);
+
+        // Sanity check: all indexes hold the id before deregistration.
+        env.as_contract(&client.address, || {
+            // PlayersByLevel(Unverified)
+            let l0: soroban_sdk::Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PlayersByLevel(ProgressLevel::Unverified))
+                .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+            assert!(
+                l0.contains(player_id),
+                "player must be in PlayersByLevel(Unverified) before deregister"
+            );
+            // PlayersByLevelRegion(Unverified, "West Africa")
+            let comp: soroban_sdk::Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PlayersByLevelRegion(
+                    ProgressLevel::Unverified,
+                    String::from_str(&env, "West Africa"),
+                ))
+                .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+            assert!(
+                comp.contains(player_id),
+                "player must be in composite index before deregister"
+            );
+            // PlayerDeactivated must not be set yet
+            assert!(
+                !env.storage().persistent().has(&DataKey::PlayerDeactivated(player_id)),
+                "deactivation flag must be absent before deregister"
+            );
+        });
+
+        // Deregister
+        client.deregister_player(&player_id);
+
+        // Verify every trace of the player is gone.
+        env.as_contract(&client.address, || {
+            // Primary records
+            assert!(!env.storage().persistent().has(&DataKey::Player(player_id)));
+            assert!(!env.storage().persistent().has(&DataKey::PlayerByWallet(wallet.clone())));
+            assert!(!env.storage().persistent().has(&DataKey::PlayerLevel(player_id)));
+
+            // PlayerIndex must not contain the id
+            let all_ids: soroban_sdk::Vec<u64> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PlayerIndex)
+                .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+            assert!(!all_ids.contains(player_id), "PlayerIndex must not contain deregistered id");
+
+            // PlayersByLevel — check all four level buckets
+            for lvl in [
+                ProgressLevel::Unverified,
+                ProgressLevel::VerifiedIdentity,
+                ProgressLevel::PerformanceMilestones,
+                ProgressLevel::EliteTier,
+            ] {
+                let bucket: soroban_sdk::Vec<u64> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::PlayersByLevel(lvl.clone()))
+                    .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+                assert!(
+                    !bucket.contains(player_id),
+                    "PlayersByLevel({:?}) must not contain deregistered id",
+                    lvl
+                );
+            }
+
+            // PlayersByLevelRegion — check all four level buckets with the player's region
+            for lvl in [
+                ProgressLevel::Unverified,
+                ProgressLevel::VerifiedIdentity,
+                ProgressLevel::PerformanceMilestones,
+                ProgressLevel::EliteTier,
+            ] {
+                let bucket: soroban_sdk::Vec<u64> = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::PlayersByLevelRegion(
+                        lvl.clone(),
+                        String::from_str(&env, "West Africa"),
+                    ))
+                    .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+                assert!(
+                    !bucket.contains(player_id),
+                    "PlayersByLevelRegion({:?}, West Africa) must not contain deregistered id",
+                    lvl
+                );
+            }
+
+            // PlayerDeactivated flag must be removed
+            assert!(
+                !env.storage().persistent().has(&DataKey::PlayerDeactivated(player_id)),
+                "PlayerDeactivated flag must be removed after deregister"
+            );
+
+            // PlayerRegLastSent is preserved for cooldown enforcement
+            assert!(
+                env.storage().persistent().has(&DataKey::PlayerRegLastSent(wallet.clone())),
+                "PlayerRegLastSent must survive deregistration for cooldown"
+            );
+        });
+    }
+
+    /// Deregistering a previously deactivated player also clears the flag.
+    #[test]
+    fn test_deregister_clears_deactivation_flag() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let vitals = PlayerVitals {
+            age: 22,
+            position: String::from_str(&env, "Midfielder"),
+            region: String::from_str(&env, "Europe"),
+            nationality: String::from_str(&env, "France"),
+        };
+        let hashes = vec![&env, String::from_str(&env, "QmTest")];
+        let player_id = client.register_player(&wallet, &vitals, &hashes);
+
+        // Deactivate first
+        client.deactivate_player(&player_id);
+        env.as_contract(&client.address, || {
+            assert!(
+                env.storage().persistent().has(&DataKey::PlayerDeactivated(player_id)),
+                "deactivation flag must be set after deactivate_player"
+            );
+        });
+
+        // Deregister
+        client.deregister_player(&player_id);
+
+        // Deactivation flag must be gone
+        env.as_contract(&client.address, || {
+            assert!(
+                !env.storage().persistent().has(&DataKey::PlayerDeactivated(player_id)),
+                "deactivation flag must be cleared after deregister"
+            );
+        });
     }
 
     #[test]
