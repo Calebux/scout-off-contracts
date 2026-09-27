@@ -222,6 +222,28 @@ pub fn level_advancement_skipped(env: &Env, player_id: u64, reason: &String) {
     );
 }
 
+/// Emitted when diversity gating blocks level advancement (the milestone is
+/// committed but the player's level has not advanced because they need more
+/// distinct validator affiliations).
+///
+/// topics: (event_name, player_id)  data: (milestone_index, distinct_affiliations, required)
+///
+/// `distinct_affiliations` is the player's current count of distinct validator
+/// affiliations; `required` is the threshold from `DiversityConfig`. UIs can
+/// show "needs 1 more independent validator" from this data.
+pub fn level_advancement_deferred(
+    env: &Env,
+    player_id: u64,
+    milestone_index: u32,
+    distinct_affiliations: u32,
+    required: u32,
+) {
+    env.events().publish(
+        (Symbol::new(env, "level_advancement_deferred"), player_id),
+        (milestone_index, distinct_affiliations, required),
+    );
+}
+
 /// Emitted when level advancement is skipped because the progress contract
 /// address has not been configured.  Common during testing without a full
 /// deployment.  In production this indicates a missing wiring step and the
