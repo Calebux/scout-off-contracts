@@ -92,7 +92,9 @@ pub struct FeeConfig {
     pub sub_duration_secs: u64,
     /// Maximum contacts per month for Pro tier (default: 10)
     pub pro_contact_limit: u32,
-    /// Escrow amount for trial offers (stroops)
+    /// Escrow amount for trial offers (stroops).
+    /// Set to 0 to disable trial offers entirely; any positive value
+    /// is the amount escrowed per trial offer.
     pub trial_offer_escrow_stroops: i128,
     /// Expiry window for trial offers (seconds)
     pub trial_offer_expiry_secs: u64,
