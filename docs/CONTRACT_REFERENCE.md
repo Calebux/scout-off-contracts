@@ -5211,6 +5211,8 @@ All events follow the unified `(Symbol, actor)` topic schema introduced in #246.
 | `player_record_restored` | event_name, admin (Address) | player_id (u64) | `restore_player_record` re-extended an archived player record's TTL |
 | `scout_record_restored` | event_name, admin (Address) | scout_id (u64) | `restore_scout_record` re-extended an archived scout record's TTL |
 | `migration_redeemed` | event_name, wallet (Address) | role (MigrationRole), profile_id (u64), new_contract_hint (Address) | A relayer-driven `redeem_migration_*` call seeded a historical player/scout profile |
+| `contract_paused` | event_name, admin (Address) | () | Circuit breaker engaged |
+| `contract_unpaused` | event_name, admin (Address) | () | Circuit breaker released |
 
 ### verification
 

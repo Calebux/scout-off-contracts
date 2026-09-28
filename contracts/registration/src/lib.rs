@@ -155,14 +155,16 @@ impl RegistrationContract {
     }
 
     pub fn pause_contract(env: Env) -> Result<(), ScoutChainError> {
-        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         env.storage().instance().set(&DataKey::Paused, &true);
+        events::contract_paused(&env, &admin);
         Ok(())
     }
 
     pub fn unpause_contract(env: Env) -> Result<(), ScoutChainError> {
-        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         env.storage().instance().set(&DataKey::Paused, &false);
+        events::contract_unpaused(&env, &admin);
         Ok(())
     }
 
@@ -3848,5 +3850,56 @@ mod tests {
         let record = client.get_scout_verification(&scout_id);
         assert!(record.verified);
         assert!(record.verified_by.is_some());
+    }
+
+    #[test]
+    fn test_pause_contract_emits_contract_paused_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(RegistrationContract, ());
+        let client = RegistrationContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        client.pause_contract();
+
+        assert_eq!(
+            env.events().all(),
+            soroban_sdk::vec![
+                &env,
+                (
+                    client.address.clone(),
+                    (Symbol::new(&env, "contract_paused"), admin.clone()).into_val(&env),
+                    ().into_val(&env)
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn test_unpause_contract_emits_contract_unpaused_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(RegistrationContract, ());
+        let client = RegistrationContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        client.pause_contract();
+        client.unpause_contract();
+
+        // `events().all()` reflects only the most recent invocation's events,
+        // so after `unpause_contract` the log holds exactly the unpause event.
+        assert_eq!(
+            env.events().all(),
+            soroban_sdk::vec![
+                &env,
+                (
+                    client.address.clone(),
+                    (Symbol::new(&env, "contract_unpaused"), admin.clone()).into_val(&env),
+                    ().into_val(&env)
+                )
+            ]
+        );
     }
 }
