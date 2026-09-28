@@ -1504,34 +1504,7 @@ impl RegistrationContract {
     }
 
     fn level_gte(level: &ProgressLevel, min_level: &ProgressLevel) -> bool {
-        matches!(
-            (level, min_level),
-            (ProgressLevel::Unverified, ProgressLevel::Unverified)
-                | (ProgressLevel::VerifiedIdentity, ProgressLevel::Unverified)
-                | (
-                    ProgressLevel::PerformanceMilestones,
-                    ProgressLevel::Unverified
-                )
-                | (ProgressLevel::EliteTier, ProgressLevel::Unverified)
-                | (
-                    ProgressLevel::VerifiedIdentity,
-                    ProgressLevel::VerifiedIdentity
-                )
-                | (
-                    ProgressLevel::PerformanceMilestones,
-                    ProgressLevel::VerifiedIdentity
-                )
-                | (ProgressLevel::EliteTier, ProgressLevel::VerifiedIdentity)
-                | (
-                    ProgressLevel::PerformanceMilestones,
-                    ProgressLevel::PerformanceMilestones
-                )
-                | (
-                    ProgressLevel::EliteTier,
-                    ProgressLevel::PerformanceMilestones
-                )
-                | (ProgressLevel::EliteTier, ProgressLevel::EliteTier)
-        )
+        level.rank() >= min_level.rank()
     }
 
     /// Add `player_id` to the composite (level, region) index bucket.
@@ -3848,5 +3821,35 @@ mod tests {
         let record = client.get_scout_verification(&scout_id);
         assert!(record.verified);
         assert!(record.verified_by.is_some());
+    }
+
+    /// Exhaustive test for all 16 (level, min_level) pairs confirming that
+    /// level_gte agrees with rank()-based ordering.
+    #[test]
+    fn test_level_gte_all_pairs() {
+        use scoutchain_shared_types::ProgressLevel;
+
+        let all_levels = [
+            ProgressLevel::Unverified,
+            ProgressLevel::VerifiedIdentity,
+            ProgressLevel::PerformanceMilestones,
+            ProgressLevel::EliteTier,
+        ];
+
+        for level in &all_levels {
+            for min_level in &all_levels {
+                let expected = level.rank() >= min_level.rank();
+                let actual = RegistrationContract::level_gte(level, min_level);
+                assert_eq!(
+                    actual,
+                    expected,
+                    "level_gte({:?}, {:?}) expected {} but got {}",
+                    level,
+                    min_level,
+                    expected,
+                    actual,
+                );
+            }
+        }
     }
 }
