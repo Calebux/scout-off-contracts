@@ -544,8 +544,13 @@ impl ProgressContract {
         }
 
         let effective_limit = limit.clamp(1, MAX_PAGE);
-        let start = offset + 1; // entries are 1-indexed
-        let end = (start + effective_limit - 1).min(count);
+        let start = offset.saturating_add(1); // entries are 1-indexed
+        // Use saturating_add / saturating_sub to prevent overflow when
+        // start or effective_limit are near u32::MAX.
+        let end = start
+            .saturating_add(effective_limit)
+            .saturating_sub(1)
+            .min(count);
 
         let mut entries: Vec<ProgressEntry> = Vec::new(&env);
         for i in start..=end {
@@ -609,15 +614,25 @@ impl ProgressContract {
     ) -> (Vec<ProgressEntry>, u32, u32) {
         const MAX_PAGE: u32 = 50;
 
+        // Read the actual current count from storage — used both for the
+        // initial snapshot and to clamp any caller-supplied snapshot.
+        let current_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HistoryCounter(player_id))
+            .unwrap_or(0u32);
+
         // On the first call snapshot the current count so it never changes
         // for this logical cursor, even if advance_level is called concurrently.
         let snapshot_count: u32 = match cursor_snapshot {
-            Some(s) => s,
-            None => env
-                .storage()
-                .persistent()
-                .get(&DataKey::HistoryCounter(player_id))
-                .unwrap_or(0u32),
+            Some(s) => {
+                // Validate: history is append-only, so a caller-supplied
+                // snapshot larger than the real count is always invalid.
+                // Clamp to the real count rather than trapping so this
+                // read-only view cannot be made to panic by adversarial input.
+                s.min(current_count)
+            }
+            None => current_count,
         };
 
         let next_index: u32 = cursor_next_index.unwrap_or(1);
@@ -628,7 +643,12 @@ impl ProgressContract {
         }
 
         let effective_limit = limit.clamp(1, MAX_PAGE);
-        let end = (next_index + effective_limit - 1).min(snapshot_count);
+        // Use saturating_add / saturating_sub to prevent overflow when
+        // next_index or effective_limit are near u32::MAX.
+        let end = next_index
+            .saturating_add(effective_limit)
+            .saturating_sub(1)
+            .min(snapshot_count);
 
         let mut entries: Vec<ProgressEntry> = Vec::new(&env);
         for i in next_index..=end {
@@ -642,7 +662,11 @@ impl ProgressContract {
         }
 
         // next_index for the following page; 0 signals exhaustion.
-        let returned_next = if end >= snapshot_count { 0u32 } else { end + 1 };
+        let returned_next = if end >= snapshot_count {
+            0u32
+        } else {
+            end.saturating_add(1)
+        };
 
         (entries, returned_next, snapshot_count)
     }
