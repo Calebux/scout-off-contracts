@@ -114,6 +114,11 @@ pub struct FilterResult {
     /// Pass this value as `offset` in the next call to continue pagination.
     /// A value of `0` means there are no further results.
     pub next_cursor: u64,
+    /// Whether more results exist after this page.
+    /// When `false`, the client has reached the end of the result set
+    /// and should stop paging even if `next_cursor` is non-zero
+    /// (which can happen if the underlying data changed between pages).
+    pub has_more: bool,
 }
 
 /// Direct status for a registered player.
@@ -183,10 +188,14 @@ pub enum DataKey {
     Initialized,
     /// Boolean flag indicating if contract is paused (circuit breaker)
     Paused,
-    /// Counter for generating unique player IDs
+    /// Counter for generating unique player IDs (monotonically increasing ID allocator)
     PlayerCounter,
-    /// Counter for generating unique scout IDs
+    /// Counter for generating unique scout IDs (monotonically increasing ID allocator)
     ScoutCounter,
+    /// Live count of currently registered players (incremented on register, decremented on deregister)
+    LivePlayerCount,
+    /// Live count of currently registered scouts (incremented on register, decremented on deregister)
+    LiveScoutCount,
     /// Full player profile stored by player_id
     Player(u64),
     /// Index mapping player wallet address to player_id for fast lookup

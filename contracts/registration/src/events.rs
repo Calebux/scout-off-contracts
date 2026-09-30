@@ -1,4 +1,5 @@
 #![allow(deprecated, dead_code)]
+use scoutchain_shared_types::ProgressLevel;
 use soroban_sdk::{Address, Env, Symbol};
 
 use crate::types::MigrationRole;
@@ -19,6 +20,7 @@ pub const MIGRATION_REDEEMED: &str = "migration_redeemed";
 pub const WIRING_UPDATED: &str = "wiring_updated";
 pub const CONTRACT_PAUSED: &str = "contract_paused";
 pub const CONTRACT_UNPAUSED: &str = "contract_unpaused";
+pub const REG_COOLDOWN_UPDATED: &str = "reg_cooldown_updated";
 
 /// topics: (event_name, admin, link)  data: (new_address, new_epoch)
 ///
@@ -107,12 +109,12 @@ pub fn player_reactivated(env: &Env, player_id: u64, admin: &Address) {
     );
 }
 
-/// topics: (event_name, caller)  data: player_id
+/// topics: (event_name, caller)  data: (player_id, level)
 /// `caller` is the progress contract address performing the level sync.
-pub fn player_level_synced(env: &Env, player_id: u64, caller: &Address) {
+pub fn player_level_synced(env: &Env, player_id: u64, caller: &Address, level: &ProgressLevel) {
     env.events().publish(
         (Symbol::new(env, "player_level_synced"), caller.clone()),
-        player_id,
+        (player_id, level.clone()),
     );
 }
 
@@ -137,6 +139,14 @@ pub fn scout_reactivated(env: &Env, scout_id: u64, admin: &Address) {
     env.events().publish(
         (Symbol::new(env, SCOUT_REACTIVATED), admin.clone()),
         scout_id,
+    );
+}
+
+/// topics: (event_name, admin)  data: (old_cooldown_secs, new_cooldown_secs)
+pub fn reg_cooldown_updated(env: &Env, admin: &Address, old_cooldown: u64, new_cooldown: u64) {
+    env.events().publish(
+        (Symbol::new(env, REG_COOLDOWN_UPDATED), admin.clone()),
+        (old_cooldown, new_cooldown),
     );
 }
 
