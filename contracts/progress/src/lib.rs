@@ -242,16 +242,30 @@ impl ProgressContract {
 
     /// Reset a player's level for dispute resolution.
     /// Existing history is preserved; a new history entry records the reset.
+    ///
+    /// Returns [`ProgressError::NoLevelChange`] when `target_level` equals the
+    /// player's current level so callers are informed of the no-op rather than
+    /// silently writing a history entry that does not represent a real change.
     pub fn reset_player_level(
         env: Env,
         player_id: u64,
         target_level: ProgressLevel,
     ) -> Result<(), ProgressError> {
+        // Bump instance TTL at the start of every state-changing entrypoint
+        // so the contract remains live even after a period of inactivity.
+        Self::bump_instance_ttl(&env);
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
 
         let old_level = Self::get_current_level(&env, player_id);
+
+        // Guard: reject no-op resets so history stays meaningful and the
+        // Merkle root is not perturbed by a call that changes nothing.
+        if old_level == target_level {
+            return Err(ProgressError::NoLevelChange);
+        }
+
         Self::record_progress_entry(
             &env,
             player_id,
@@ -2259,6 +2273,54 @@ mod tests {
         let (env, client, _) = setup();
         env.mock_auths(&[]);
         client.reset_player_level(&1u64, &ProgressLevel::Unverified);
+    }
+
+    // #1464: reset_player_level must return NoLevelChange when target == current level.
+    // No history entry must be written and no state must change.
+    #[test]
+    fn test_reset_player_level_noop_when_target_equals_current() {
+        let (_, client, validator) = setup();
+        let player_id = 1u64;
+
+        // Advance to VerifiedIdentity
+        client.advance_level(&validator, &player_id, &1u32);
+        assert_eq!(client.get_level(&player_id), ProgressLevel::VerifiedIdentity);
+        assert_eq!(client.get_history_count(&player_id), 1);
+
+        // Attempt to reset to current level — must be rejected
+        let result = client.try_reset_player_level(&player_id, &ProgressLevel::VerifiedIdentity);
+        assert_eq!(result, Err(Ok(ProgressError::NoLevelChange)));
+
+        // Level and history count must be unchanged
+        assert_eq!(client.get_level(&player_id), ProgressLevel::VerifiedIdentity);
+        assert_eq!(
+            client.get_history_count(&player_id),
+            1,
+            "no history entry must be written for a no-op reset"
+        );
+    }
+
+    // #1464: reset_player_level must not write history when target == current
+    // even when the current level is Unverified (the default).
+    #[test]
+    fn test_reset_player_level_noop_at_default_unverified() {
+        let (_, client, _validator) = setup();
+        let player_id = 2u64;
+
+        // Player has never advanced — level is Unverified, count is 0
+        assert_eq!(client.get_level(&player_id), ProgressLevel::Unverified);
+        assert_eq!(client.get_history_count(&player_id), 0);
+
+        // Resetting to Unverified on an already-Unverified player must be a no-op
+        let result = client.try_reset_player_level(&player_id, &ProgressLevel::Unverified);
+        assert_eq!(result, Err(Ok(ProgressError::NoLevelChange)));
+
+        assert_eq!(client.get_level(&player_id), ProgressLevel::Unverified);
+        assert_eq!(
+            client.get_history_count(&player_id),
+            0,
+            "no history entry must be written for a no-op reset at Unverified"
+        );
     }
 
     #[test]
