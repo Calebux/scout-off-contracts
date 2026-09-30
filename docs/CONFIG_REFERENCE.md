@@ -14,6 +14,7 @@ This document describes every field in `config/testnet.json` and `config/mainnet
 | `network_passphrase` | string | Stellar network passphrase for transaction signing. | **Testnet:** `Test SDF Network ; September 2015`<br>**Mainnet:** `Public Global Stellar Network ; September 2015` |
 | `friendbot_url` | string \| null | Friendbot faucet URL for funding test accounts. | **Testnet:** `https://friendbot.stellar.org`<br>**Mainnet:** `null` (no faucet on mainnet) |
 | `xlm_token_address` | string | Contract address of the native XLM token (SAC-0001). | **Sourced from Stellar's official SAC registry.**<br>**Testnet:** `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC`<br>**Mainnet:** `CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA`<br>**Owner:** Release Engineer verifies before each deployment. |
+| `admin_secret` | string | Secret key for the platform admin account. Used by RUNBOOK scripts for `require_auth()` on privileged operations (pause, unpause, rotation, health checks). | **Must be set in `.env`** — not stored in config files. Sensitivity: **high**. |
 
 ---
 
@@ -79,6 +80,22 @@ Before running `./scripts/deploy.sh mainnet`:
 - [ ] `.env` `ADMIN_ADDRESS` → mainnet admin G-address
 - [ ] `.env` `XLM_TOKEN_ADDRESS` → matches `config/mainnet.json`
 - [ ] CI secrets updated: `RPC_URL`, `HORIZON_URL`, `NETWORK_PASSPHRASE`
+
+---
+
+## Contract-Level Settings
+
+### Registration Cooldown (`set_reg_cooldown` / `get_reg_cooldown`)
+
+| Setting | Default | Bounds | Description |
+|---------|---------|--------|-------------|
+| `reg_cooldown_secs` | `86400` (24h) | `0..=604800` (0 = disabled, max 7 days) | Per-wallet cooldown between `register_player` and `register_scout` calls. Set via `set_reg_cooldown` (admin only). Emits `reg_cooldown_updated` event. |
+
+### Verification Cooldown (`set_reg_cooldown` / `get_reg_cooldown`)
+
+| Setting | Default | Bounds | Description |
+|---------|---------|--------|-------------|
+| `reg_cooldown_secs` | `0` (disabled) | `0..=604800` (0 = disabled, max 7 days) | Per-wallet cooldown between `register_validator` calls. Set via `set_reg_cooldown` (admin only). |
 
 ---
 
