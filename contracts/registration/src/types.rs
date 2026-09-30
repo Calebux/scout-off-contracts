@@ -183,10 +183,14 @@ pub enum DataKey {
     Initialized,
     /// Boolean flag indicating if contract is paused (circuit breaker)
     Paused,
-    /// Counter for generating unique player IDs
+    /// Counter for generating unique player IDs (monotonically increasing ID allocator)
     PlayerCounter,
-    /// Counter for generating unique scout IDs
+    /// Counter for generating unique scout IDs (monotonically increasing ID allocator)
     ScoutCounter,
+    /// Live count of currently registered players (incremented on register, decremented on deregister)
+    LivePlayerCount,
+    /// Live count of currently registered scouts (incremented on register, decremented on deregister)
+    LiveScoutCount,
     /// Full player profile stored by player_id
     Player(u64),
     /// Index mapping player wallet address to player_id for fast lookup
