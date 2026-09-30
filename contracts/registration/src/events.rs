@@ -18,6 +18,8 @@ pub const ADMIN_TRANSFER_PROPOSED: &str = "admin_transfer_proposed";
 pub const ADMIN_TRANSFERRED: &str = "admin_transferred";
 pub const MIGRATION_REDEEMED: &str = "migration_redeemed";
 pub const WIRING_UPDATED: &str = "wiring_updated";
+pub const CONTRACT_PAUSED: &str = "contract_paused";
+pub const CONTRACT_UNPAUSED: &str = "contract_unpaused";
 pub const REG_COOLDOWN_UPDATED: &str = "reg_cooldown_updated";
 
 /// topics: (event_name, admin, link)  data: (new_address, new_epoch)
@@ -180,4 +182,16 @@ pub fn scout_record_restored(env: &Env, admin: &Address, scout_id: u64) {
         (Symbol::new(env, "scout_record_restored"), admin.clone()),
         scout_id,
     );
+}
+
+/// topics: (event_name, admin)  data: ()
+pub fn contract_paused(env: &Env, admin: &Address) {
+    env.events()
+        .publish((Symbol::new(env, CONTRACT_PAUSED), admin.clone()), ());
+}
+
+/// topics: (event_name, admin)  data: ()
+pub fn contract_unpaused(env: &Env, admin: &Address) {
+    env.events()
+        .publish((Symbol::new(env, CONTRACT_UNPAUSED), admin.clone()), ());
 }
