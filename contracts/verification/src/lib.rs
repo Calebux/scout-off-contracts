@@ -1960,7 +1960,7 @@ impl VerificationContract {
         );
         env.storage()
             .persistent()
-            .set(&DataKey::AttestationKeyOwner(public_key.clone()), &wallet);
+            .set(&DataKey::AttestationKeyOwner(public_key), &wallet);
         env.storage().persistent().extend_ttl(
             &DataKey::AttestationKeyOwner(public_key),
             PERSISTENT_TTL_MIN,

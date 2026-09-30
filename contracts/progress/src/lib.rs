@@ -1535,6 +1535,19 @@ mod tests {
     };
 
     #[test]
+    fn test_get_level_unverified_for_new_player() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(ProgressContract, ());
+        let client = ProgressContractClient::new(&env, &id);
+        client.initialize(&Address::generate(&env));
+
+        // A player that has never had advance_level called should be Unverified
+        let player_id = 42u64;
+        assert_eq!(client.get_level(&player_id), ProgressLevel::Unverified);
+    }
+
+    #[test]
     fn test_get_verification_contract_before_and_after_configuration() {
         let env = Env::default();
         env.mock_all_auths();
