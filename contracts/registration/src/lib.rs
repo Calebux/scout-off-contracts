@@ -527,7 +527,8 @@ impl RegistrationContract {
                 evidence_ref: None,
                 method: None,
             },
-            registered_at: env.ledger().timestamp(),
+            // Reuse `now` instead of calling env.ledger().timestamp() a second time.
+            registered_at: now,
         };
 
         env.storage()
@@ -541,6 +542,13 @@ impl RegistrationContract {
         env.storage()
             .persistent()
             .set(&DataKey::ScoutByWallet(wallet.clone()), &scout_id);
+        // Extend TTL on ScoutByWallet so scout_access can look up the scout
+        // by wallet even after the key would otherwise be archived.
+        env.storage().persistent().extend_ttl(
+            &DataKey::ScoutByWallet(wallet.clone()),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
 
         // Record cooldown timestamp.
         env.storage()
@@ -682,9 +690,21 @@ impl RegistrationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Scout(scout_id), &profile);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Scout(scout_id),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
         env.storage()
             .persistent()
             .set(&DataKey::ScoutByWallet(wallet.clone()), &scout_id);
+        // Extend TTL on ScoutByWallet so scout_access can look up the scout
+        // by wallet even after the key would otherwise be archived.
+        env.storage().persistent().extend_ttl(
+            &DataKey::ScoutByWallet(wallet.clone()),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
 
         events::scout_registered(&env, scout_id, &wallet);
         Ok(scout_id)
@@ -3848,5 +3868,85 @@ mod tests {
         let record = client.get_scout_verification(&scout_id);
         assert!(record.verified);
         assert!(record.verified_by.is_some());
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #1440: ScoutByWallet TTL extended and single timestamp read
+    // -------------------------------------------------------------------------
+
+    /// register_scout must extend the TTL on ScoutByWallet so scout_access can
+    /// look up the scout by wallet even after the Scout entry's TTL window would
+    /// otherwise have archived the index key.
+    ///
+    /// Also verifies that `registered_at` equals the value captured before the
+    /// profile is built (i.e., `now` is reused rather than calling
+    /// `env.ledger().timestamp()` a second time).
+    #[test]
+    fn test_register_scout_extends_scout_by_wallet_ttl() {
+        use soroban_sdk::testutils::Ledger;
+
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+            l.timestamp = 1_000_000;
+            l.max_entry_ttl = 1_000_000;
+        });
+
+        let wallet = Address::generate(&env);
+        let region = String::from_str(&env, "West Africa");
+        let scout_id = client.register_scout(&wallet, &region);
+
+        // Advance past the PERSISTENT_TTL_MAX to confirm the key was extended.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100 + PERSISTENT_TTL_MAX + 1;
+        });
+
+        // get_scout_by_wallet should still succeed because ScoutByWallet TTL was extended.
+        let fetched = client.get_scout_by_wallet(&wallet);
+        assert_eq!(fetched.scout_id, scout_id);
+
+        // registered_at must match the timestamp that was current when
+        // register_scout was called (no double-read).
+        let scout = client.get_scout(&scout_id);
+        assert_eq!(scout.registered_at, 1_000_000u64);
+    }
+
+    /// admin_seed_scout must extend the TTL on both Scout and ScoutByWallet.
+    #[test]
+    fn test_admin_seed_scout_extends_both_ttls() {
+        use soroban_sdk::testutils::Ledger;
+
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+            l.max_entry_ttl = 1_000_000;
+        });
+
+        let wallet = Address::generate(&env);
+        let scout_id = client.admin_seed_scout(
+            &wallet,
+            &String::from_str(&env, "Europe"),
+            &42u64,
+            &999u64,
+            &false,
+        );
+
+        // Advance the ledger past the default Soroban TTL.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100 + PERSISTENT_TTL_MAX + 1;
+        });
+
+        // Both lookups must still succeed.
+        let scout = client.get_scout(&scout_id);
+        assert_eq!(scout.wallet, wallet);
+
+        let fetched = client.get_scout_by_wallet(&wallet);
+        assert_eq!(fetched.scout_id, scout_id);
     }
 }
