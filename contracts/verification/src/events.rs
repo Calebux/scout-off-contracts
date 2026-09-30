@@ -1,5 +1,5 @@
 #![allow(deprecated)]
-use soroban_sdk::{Address, Env, String, Symbol};
+use soroban_sdk::{Address, BytesN, Env, String, Symbol};
 
 pub const MILESTONE_APPROVED: &str = "milestone_approved";
 pub const VALIDATOR_REGISTERED: &str = "validator_registered";
@@ -16,6 +16,7 @@ pub const PROGRESS_CONTRACT_UPDATED: &str = "progress_contract_updated";
 pub const DISPUTE_RESOLVED: &str = "dispute_resolved";
 pub const ADMIN_TRANSFER_PROPOSED: &str = "admin_transfer_proposed";
 pub const ADMIN_TRANSFERRED: &str = "admin_transferred";
+pub const CONTRACT_UPGRADED: &str = "contract_upgraded";
 pub const ATTESTATION_RECORDED: &str = "attestation_recorded";
 pub const ATTESTATION_WINDOW_EXPIRED: &str = "attestation_window_expired";
 pub const VALIDATOR_PENDING_VOTES_INVALIDATED: &str = "validator_votes_invalidated";
@@ -440,5 +441,14 @@ pub fn dispute_tallied(
     env.events().publish(
         (Symbol::new(env, DISPUTE_TALLIED), player_id),
         (milestone_index, upheld, votes_for, votes_against),
+    );
+}
+
+/// Emitted before `update_current_contract_wasm` — attributed to the old code version.
+/// topics: (event_name, admin)  data: new_wasm_hash
+pub fn contract_upgraded(env: &Env, admin: &Address, new_wasm_hash: &BytesN<32>) {
+    env.events().publish(
+        (Symbol::new(env, CONTRACT_UPGRADED), admin.clone()),
+        new_wasm_hash.clone(),
     );
 }

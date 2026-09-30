@@ -1,6 +1,6 @@
 #![allow(deprecated, dead_code)]
 use scoutchain_shared_types::ProgressLevel;
-use soroban_sdk::{Address, Env, Symbol};
+use soroban_sdk::{Address, BytesN, Env, Symbol};
 
 use crate::types::MigrationRole;
 
@@ -16,6 +16,7 @@ pub const SCOUT_DEACTIVATED: &str = "scout_deactivated";
 pub const SCOUT_REACTIVATED: &str = "scout_reactivated";
 pub const ADMIN_TRANSFER_PROPOSED: &str = "admin_transfer_proposed";
 pub const ADMIN_TRANSFERRED: &str = "admin_transferred";
+pub const CONTRACT_UPGRADED: &str = "contract_upgraded";
 pub const MIGRATION_REDEEMED: &str = "migration_redeemed";
 pub const WIRING_UPDATED: &str = "wiring_updated";
 pub const CONTRACT_PAUSED: &str = "contract_paused";
@@ -126,6 +127,14 @@ pub fn scout_verified(env: &Env, scout_id: u64, wallet: &Address) {
     );
 }
 
+/// Emitted before `update_current_contract_wasm` — attributed to the old code version.
+/// topics: (event_name, admin)  data: new_wasm_hash
+pub fn contract_upgraded(env: &Env, admin: &Address, new_wasm_hash: &BytesN<32>) {
+    env.events().publish(
+        (Symbol::new(env, CONTRACT_UPGRADED), admin.clone()),
+        new_wasm_hash.clone(),
+    );
+}
 /// topics: (event_name, admin)  data: scout_id
 pub fn scout_deactivated(env: &Env, scout_id: u64, admin: &Address) {
     env.events().publish(
