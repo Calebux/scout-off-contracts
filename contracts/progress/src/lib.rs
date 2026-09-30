@@ -1562,6 +1562,25 @@ mod tests {
     }
 
     #[test]
+    fn test_advance_level_blocked_when_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(ProgressContract, ());
+        let client = ProgressContractClient::new(&env, &id);
+        client.initialize(&Address::generate(&env));
+
+        // Pause the contract
+        client.pause_contract();
+
+        let validator = Address::generate(&env);
+        let player_id = 1u64;
+
+        // advance_level should be blocked with ContractPaused
+        let result = client.try_advance_level(&validator, &player_id, &1u32);
+        assert_eq!(result, Err(Ok(ProgressError::ContractPaused)));
+    }
+
+    #[test]
     fn test_get_verification_contract_before_and_after_configuration() {
         let env = Env::default();
         env.mock_all_auths();
