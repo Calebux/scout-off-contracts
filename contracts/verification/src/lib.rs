@@ -2408,10 +2408,18 @@ impl VerificationContract {
     /// > **Deprecated**: this legacy method is unbounded.  High-volume callers
     /// should use [`get_validator_players_page`] to keep response sizes bounded.
     pub fn get_validator_players(env: Env, wallet: Address) -> Vec<u64> {
-        env.storage()
+        let key = DataKey::ValidatorPlayers(wallet);
+        let list: Vec<u64> = env
+            .storage()
             .persistent()
-            .get(&DataKey::ValidatorPlayers(wallet))
-            .unwrap_or_else(|| Vec::new(&env))
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !list.is_empty() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
+        list
     }
 
     /// Return a bounded, paginated page of distinct player IDs for which
@@ -2434,11 +2442,17 @@ impl VerificationContract {
         offset: u32,
         limit: u32,
     ) -> ValidatorPlayersPage {
+        let key = DataKey::ValidatorPlayers(wallet);
         let list: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::ValidatorPlayers(wallet))
+            .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
+        if !list.is_empty() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
 
         let total = list.len();
         let cap = limit.min(50);
@@ -3960,6 +3974,9 @@ impl VerificationContract {
             &vp_key,
             &(safe_add_u32(vp_count, 1).map_err(|_| VerificationError::Overflow)?),
         );
+        env.storage()
+            .persistent()
+            .extend_ttl(&vp_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
 
         let vp_index_key = DataKey::ValidatorPlayers(validator_wallet.clone());
         let mut vp_players: Vec<u64> = env
@@ -3970,6 +3987,9 @@ impl VerificationContract {
         if !vp_players.contains(player_id) {
             vp_players.push_back(player_id);
             env.storage().persistent().set(&vp_index_key, &vp_players);
+            env.storage()
+                .persistent()
+                .extend_ttl(&vp_index_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
         }
 
         let total: u32 = env
@@ -4023,6 +4043,9 @@ impl VerificationContract {
         env.storage()
             .persistent()
             .set(&validator_milestones_key, &validator_milestones);
+        env.storage()
+            .persistent()
+            .extend_ttl(&validator_milestones_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
 
         events::milestone_approved(
             env,
@@ -4050,6 +4073,11 @@ impl VerificationContract {
             env.storage().persistent().set(
                 &DataKey::PlayerAffiliations(player_id),
                 &player_affiliations,
+            );
+            env.storage().persistent().extend_ttl(
+                &DataKey::PlayerAffiliations(player_id),
+                PERSISTENT_TTL_MIN,
+                PERSISTENT_TTL_MAX,
             );
         }
 
