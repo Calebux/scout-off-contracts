@@ -34,6 +34,12 @@ Use the structure below for upcoming MINOR or MAJOR contract changes:
 
 > **Breaking-change classification rules:** See [docs/VERSIONING.md — What Constitutes a Breaking Change](VERSIONING.md#what-constitutes-a-breaking-change) for the full criteria (storage layout changes, function signature changes, error code renumbering, event schema changes, cross-contract interface changes).
 
+- Version: `v2.0.0`
+- Release date: `2026-09-27`
+- Contracts affected: `registration`, `scout_access`, `verification`
+- Summary: Fixed infinite paging bug where `limit=0` produced a non-advancing cursor. Added `has_more: bool` field to `FilterResult` (registration ABI change). Clamped `limit` to 1..=50 across all paginated getters (`filter_players`, `get_scout_contacts_page`, `list_disputes_page`, `get_global_milestone_index`, `get_validator_milestones_page`, `get_validator_milestones_page_v2`). Documented pagination convention in CONTRACT_REFERENCE.md.
+- Classification: `Breaking (MAJOR)`
+
 ---
 
 ### [Unreleased] — fix/1412-progress-wiring-state-use-wiring-link

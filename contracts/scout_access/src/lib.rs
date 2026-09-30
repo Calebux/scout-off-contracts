@@ -2054,7 +2054,8 @@ impl ScoutAccessContract {
     /// real `expires_at` satisfies the predicate — the bucket is just a
     /// pre-filter, not the authoritative answer.
     ///
-    /// `limit` is capped at `MAX_EXPIRY_PAGE_SIZE` (50) to bound CPU cost per call.
+    /// `limit` is clamped to 1..=50 to bound CPU cost per call.
+    /// A `limit` of 0 is treated as 1.
     /// Page through results by advancing `before_timestamp` by one second past
     /// the latest `expires_at` in the previous page.
     pub fn get_expiring_subscriptions(
@@ -2065,9 +2066,8 @@ impl ScoutAccessContract {
         Self::bump_instance_ttl(&env);
 
         const MAX_EXPIRY_PAGE_SIZE: u32 = 50;
-        const SECS_PER_DAY: u64 = 86_400;
 
-        let effective_limit = limit.min(MAX_EXPIRY_PAGE_SIZE);
+        let effective_limit = if limit == 0 { 1 } else { limit.min(MAX_EXPIRY_PAGE_SIZE) };
         let cutoff_day = before_timestamp / SECS_PER_DAY;
 
         let mut results: soroban_sdk::Vec<Subscription> = soroban_sdk::Vec::new(&env);
@@ -2157,14 +2157,16 @@ impl ScoutAccessContract {
 
     /// Return a bounded, paginated page of player IDs contacted by `scout`,
     /// together with the total number of contacts.
+    /// Retrieve a paginated page of scout contact player IDs.
     ///
     /// This is the canonical paginated successor to the unbounded
     /// `get_scout_contacts`.  The `total` field lets callers determine when
     /// paging is complete without over-fetching.
     ///
-    /// **Pagination**: `offset` is a zero-based item offset; `limit` is capped
-    /// at 50 entries per page, matching the convention used by
-    /// `get_global_milestone_index` and `get_validator_milestones_page_v2`.
+    /// **Pagination**: `offset` is a zero-based item offset; `limit` is clamped
+    /// to 1..=50 entries per page. A `limit` of 0 is treated as 1. This matches
+    /// the convention used by `get_global_milestone_index`,
+    /// `list_disputes_page`, and `get_validator_milestones_page_v2`.
     ///
     /// **Ordering**: entries are returned in contact order (oldest first).
     pub fn get_scout_contacts_page(
@@ -2187,7 +2189,7 @@ impl ScoutAccessContract {
         }
 
         let total = list.len();
-        let cap = limit.min(50);
+        let cap = if limit == 0 { 1 } else { limit.min(50) };
         let mut entries: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
         let mut i = offset;
         while i < total && entries.len() < cap {
@@ -2246,12 +2248,14 @@ impl ScoutAccessContract {
 
     /// Page through every `EvidenceAccessGrant` ever issued for `player_id`,
     /// oldest-first, so a player-facing UI can audit who has access to their
-    /// evidence. `limit` is capped at `MAX_ACCESS_GRANT_PAGE_LIMIT` (50) and
-    /// equals `ACCESS_GRANT_PAGE_SIZE`, so a single call reads at most two
-    /// index pages (the tail of one, the head of the next) plus one grant
-    /// record per returned entry — CPU cost bounded by `limit`, independent
-    /// of how many grants `player_id` has accumulated in total (proven at
-    /// 1,000+ grants by `contracts/scout_access/tests/cost_budget.rs`).
+    /// evidence. `limit` is clamped to 1..=50, matching the on-chain index
+    /// page size.
+    ///
+    /// **Pagination**: `offset` is a zero-based item offset; `limit` is
+    /// clamped to 1..=50 per page. A `limit` of 0 is treated as 1.
+    /// This matches the convention used by `get_scout_contacts_page`,
+    /// `get_global_milestone_index`, `list_disputes_page`, and
+    /// `get_validator_milestones_page_v2`.
     ///
     /// Page through a player's full history by advancing `offset` by the
     /// number of entries returned in the previous page.
@@ -2264,7 +2268,7 @@ impl ScoutAccessContract {
         Self::bump_instance_ttl(&env);
         let mut results: soroban_sdk::Vec<EvidenceAccessGrant> = soroban_sdk::Vec::new(&env);
 
-        let effective_limit = limit.min(MAX_ACCESS_GRANT_PAGE_LIMIT);
+        let effective_limit = if limit == 0 { 1 } else { limit.min(MAX_ACCESS_GRANT_PAGE_LIMIT) };
         if effective_limit == 0 {
             return results;
         }
