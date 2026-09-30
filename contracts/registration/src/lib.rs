@@ -265,7 +265,7 @@ impl RegistrationContract {
             PERSISTENT_TTL_MIN,
             PERSISTENT_TTL_MAX,
         );
-        events::player_level_synced(&env, player_id, &progress_contract);
+        events::player_level_synced(&env, player_id, &progress_contract, &level);
         Ok(())
     }
 
@@ -3093,6 +3093,48 @@ mod tests {
                     )
                         .into_val(&env),
                     player_id.into_val(&env)
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn test_set_player_level_emits_event_with_level() {
+        use soroban_sdk::testutils::Events;
+        use soroban_sdk::IntoVal;
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        // Register a player
+        let wallet = Address::generate(&env);
+        let hashes = vec![&env, String::from_str(&env, "QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB")];
+        let player_id = client.register_player(&wallet, &dummy_vitals(&env), &hashes);
+
+        // Wire a progress contract
+        let progress_contract = Address::generate(&env);
+        client.set_progress_contract(&progress_contract);
+
+        // Clear events so far
+        let _ = env.events().all();
+
+        // Call set_player_level
+        client.set_player_level(&player_id, &ProgressLevel::VerifiedIdentity);
+
+        // Verify the event data includes both player_id and the new level
+        let events = env.events().all();
+        assert_eq!(
+            events,
+            soroban_sdk::vec![
+                &env,
+                (
+                    client.address.clone(),
+                    (
+                        soroban_sdk::Symbol::new(&env, "player_level_synced"),
+                        progress_contract.clone(),
+                    )
+                        .into_val(&env),
+                    (player_id, ProgressLevel::VerifiedIdentity).into_val(&env)
                 )
             ]
         );

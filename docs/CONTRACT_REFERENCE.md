@@ -5202,7 +5202,7 @@ All events follow the unified `(Symbol, actor)` topic schema introduced in #246.
 | `player_deactivated` | event_name, admin (Address) | player_id (u64) | Admin soft-hides a player from filter results |
 | `player_reactivated` | event_name, admin (Address) | player_id (u64) | Admin restores a soft-hidden player to filter results |
 | `scout_verified` | event_name, wallet (Address) | scout_id (u64) | Admin verifies a scout |
-| `player_level_synced` | event_name, progress_contract (Address) | player_id (u64) | Progress contract syncs a player's level |
+| `player_level_synced` | event_name, progress_contract (Address) | (player_id (u64), level (ProgressLevel)) | Progress contract syncs a player's level to the given level |
 | `admin_transfer_proposed` | event_name, old_admin (Address) | new_admin (Address) | Current admin proposes a replacement |
 | `admin_transferred` | event_name, old_admin (Address) | new_admin (Address) | Pending admin accepts control |
 | `wiring_updated` | event_name, admin (Address), link (Symbol) | new_address (Address), new_epoch (u32) | `set_progress_contract` re-wired the `progress_contract` peer link (issue #1041 — see [Cross-Contract Wiring](#cross-contract-wiring) below) |

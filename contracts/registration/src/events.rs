@@ -1,4 +1,5 @@
 #![allow(deprecated, dead_code)]
+use scoutchain_shared_types::ProgressLevel;
 use soroban_sdk::{Address, Env, Symbol};
 
 use crate::types::MigrationRole;
@@ -105,12 +106,12 @@ pub fn player_reactivated(env: &Env, player_id: u64, admin: &Address) {
     );
 }
 
-/// topics: (event_name, caller)  data: player_id
+/// topics: (event_name, caller)  data: (player_id, level)
 /// `caller` is the progress contract address performing the level sync.
-pub fn player_level_synced(env: &Env, player_id: u64, caller: &Address) {
+pub fn player_level_synced(env: &Env, player_id: u64, caller: &Address, level: &ProgressLevel) {
     env.events().publish(
         (Symbol::new(env, "player_level_synced"), caller.clone()),
-        player_id,
+        (player_id, level.clone()),
     );
 }
 
