@@ -291,6 +291,19 @@ async function reconcileScouts(pg, cfg, report) {
     // in migrations/001_initial_schema.sql and is checked here against the
     // on-chain value returned by registration.get_scout(...).verified.
     report.check("scouts", key, "verified", Boolean(s.verified), Boolean(dbRow.verified));
+
+    const deactivatedResult = invoke(
+      cfg.network,
+      cfg.source,
+      cfg.registrationId,
+      "is_scout_deactivated",
+      ["--scout_id", key],
+    );
+    if (deactivatedResult.ok) {
+      report.check("scouts", key, "deactivated", deactivatedResult.value === true, Boolean(dbRow.deactivated));
+    } else {
+      report.add("scouts", key, "deactivated", "getter_failed", dbRow.deactivated, deactivatedResult.error);
+    }
   }
 }
 

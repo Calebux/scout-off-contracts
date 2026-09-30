@@ -87,6 +87,7 @@ mod registration_contract {
     #[allow(dead_code)]
     pub trait RegistrationContractClient {
         fn get_scout_by_wallet(env: Env, wallet: Address) -> Result<ScoutProfile, RegClientError>;
+        fn is_scout_deactivated(env: Env, scout_id: u64) -> bool;
     }
 }
 
@@ -155,6 +156,32 @@ pub struct ScoutAccessContract;
 #[contractimpl]
 impl ScoutAccessContract {
     #[inline(always)]
+    /// Check that the scout (identified by wallet) has not been deactivated
+    /// in the registration contract. This is a best-effort cross-contract call:
+    /// if the registration contract is not wired, the check is skipped (graceful
+    /// degradation, matching the Pro-tier verification pattern).
+    fn require_scout_not_deactivated(env: &Env, scout: &Address) -> Result<(), ScoutAccessError> {
+        if let Some(reg_contract_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RegistrationContract)
+        {
+            let reg_client = registration_contract::Client::new(env, &reg_contract_addr);
+            match reg_client.try_get_scout_by_wallet(scout) {
+                Ok(Ok(profile)) => {
+                    if reg_client.is_scout_deactivated(&profile.scout_id) {
+                        return Err(ScoutAccessError::ScoutDeactivated);
+                    }
+                }
+                _ => {
+                    // Scout not found in registration contract — allow the
+                    // operation (graceful degradation).
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn bump_instance_ttl(env: &Env) {
         env.storage()
             .instance()
@@ -579,6 +606,9 @@ impl ScoutAccessContract {
         Self::require_initialized(&env)?;
         scout.require_auth();
 
+        // Reject deactivated scouts at all tiers.
+        Self::require_scout_not_deactivated(&env, &scout)?;
+
         let now = env.ledger().timestamp();
 
         // Track whether this is a renewal/upgrade of an existing subscription.
@@ -796,6 +826,9 @@ impl ScoutAccessContract {
         // sufficient to protect against unauthorised charges.
         scout.require_auth();
 
+        // Reject deactivated scouts.
+        Self::require_scout_not_deactivated(&env, &scout)?;
+
         // Check auto-renewal opt-in.
         let auto_renew_enabled: bool = env
             .storage()
@@ -1007,6 +1040,9 @@ impl ScoutAccessContract {
         Self::require_pay_to_contact_not_paused(&env)?;
         scout.require_auth();
 
+        // Reject deactivated scouts.
+        Self::require_scout_not_deactivated(&env, &scout)?;
+
         let subscription: Subscription = env
             .storage()
             .persistent()
@@ -1151,6 +1187,10 @@ impl ScoutAccessContract {
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         scout.require_auth();
+
+        // Reject deactivated scouts.
+        Self::require_scout_not_deactivated(&env, &scout)?;
+
         let sub = Self::require_active_subscription(&env, &scout)?;
 
         let config = Self::fee_config(&env);
@@ -1312,6 +1352,9 @@ impl ScoutAccessContract {
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         scout.require_auth();
+
+        // Reject deactivated scouts.
+        Self::require_scout_not_deactivated(&env, &scout)?;
 
         validate_cid(&details_hash).map_err(|_| ScoutAccessError::InvalidInput)?;
 
