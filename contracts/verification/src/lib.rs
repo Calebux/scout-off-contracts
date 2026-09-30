@@ -656,25 +656,57 @@ impl VerificationContract {
     ///   bounded cascade sweep that flags every milestone the validator previously
     ///   approved as `MilestonePendingReReview`.  If the validator has more than
     ///   `CASCADE_LIMIT` (50) prior approvals, the sweep stops after flagging the
-    ///   first batch and stores a cursor; call `continue_revocation_cascade` to
-    ///   finish.
+    /// Remove every wallet in `wallets` from the stored `ValidatorVector` in a
+    /// single load and a single store.
     ///
-    /// Optionally accepts a reason (max 128 bytes) included in the event and
-    /// stored in the `RevocationRecord`.
-    pub fn revoke_validator(
-        env: Env,
-        wallet: Address,
-        severity: RevocationSeverity,
-        reason: Option<String>,
-    ) -> Result<(), VerificationError> {
-        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
-
-        if let Some(ref r) = reason {
-            if r.len() > 128 {
-                return Err(VerificationError::ReasonTooLong);
+    /// Kept separate from `revoke_one` because the cost profile differs by
+    /// entrypoint: the single-wallet path rewrites the vector for one wallet,
+    /// while `batch_revoke_validators` rewrites it once for the whole batch.
+    /// Rewriting per wallet inside the batch made it O(n*m) in the number of
+    /// wallets and the size of the vector.
+    fn remove_from_validator_vector(env: &Env, wallets: &Vec<Address>) {
+        let validator_vector: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ValidatorVector)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut new_vector: Vec<Address> = Vec::new(env);
+        'keep: for i in 0..validator_vector.len() {
+            let addr = validator_vector.get(i).unwrap();
+            for j in 0..wallets.len() {
+                if wallets.get(j).unwrap() == addr {
+                    continue 'keep;
+                }
             }
+            new_vector.push_back(addr);
         }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ValidatorVector, &new_vector);
+    }
 
+    /// Internal per-validator revocation shared by `revoke_validator` and
+    /// `batch_revoke_validators`.
+    ///
+    /// Everything that must stay identical between the single and batch paths
+    /// lives here: clearing the active flag, the `ActiveValidatorCount`
+    /// decrement (skipped when the validator was already inactive), pending-vote
+    /// invalidation, the `RevocationRecord`, and the revocation events
+    /// including the for-cause cascade sweep.
+    ///
+    /// `ValidatorVector` is deliberately *not* touched here — see
+    /// `remove_from_validator_vector` — because the batch path must rewrite it
+    /// once for the entire batch rather than once per wallet.
+    ///
+    /// Returns `ValidatorNotFound` if the wallet is not registered, which
+    /// aborts the whole transaction in the batch case.
+    fn revoke_one(
+        env: &Env,
+        admin: &Address,
+        wallet: &Address,
+        severity: &RevocationSeverity,
+        reason: &String,
+    ) -> Result<(), VerificationError> {
         let mut validator: Validator = env
             .storage()
             .persistent()
@@ -698,35 +730,17 @@ impl VerificationContract {
             );
         }
 
-        let validator_vector: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ValidatorVector)
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut new_vector: Vec<Address> = Vec::new(&env);
-        for i in 0..validator_vector.len() {
-            let addr = validator_vector.get(i).unwrap();
-            if addr != wallet {
-                new_vector.push_back(addr);
-            }
-        }
-        env.storage()
-            .persistent()
-            .set(&DataKey::ValidatorVector, &new_vector);
-
         // Retroactively invalidate this validator's contribution to every
         // still-open (sub-threshold) pending attestation claim.
-        let invalidated = Self::invalidate_pending_votes_for_validator(&env, &wallet);
+        let invalidated = Self::invalidate_pending_votes_for_validator(env, wallet);
         if invalidated > 0 {
-            events::validator_pending_votes_invalidated(&env, &admin, &wallet, invalidated);
+            events::validator_pending_votes_invalidated(env, admin, wallet, invalidated);
         }
-
-        let reason_str = reason.unwrap_or(String::from_str(&env, ""));
 
         // Persist a RevocationRecord for audit purposes.
         let record = RevocationRecord {
             severity: severity.clone(),
-            reason: reason_str.clone(),
+            reason: reason.clone(),
             revoked_at: env.ledger().timestamp(),
             admin: admin.clone(),
         };
@@ -742,20 +756,57 @@ impl VerificationContract {
         // Emit the appropriate revocation event.
         match severity {
             RevocationSeverity::Routine => {
-                events::validator_revoked(&env, &admin, &wallet, &reason_str);
+                events::validator_revoked(env, admin, wallet, reason);
             }
             RevocationSeverity::ForCause => {
                 env.storage()
                     .persistent()
                     .set(&DataKey::ValidatorRevokedForCause(wallet.clone()), &true);
-                events::validator_revoked(&env, &admin, &wallet, &reason_str);
-                events::validator_revoked_for_cause(&env, &admin, &wallet, &reason_str);
+                events::validator_revoked(env, admin, wallet, reason);
+                events::validator_revoked_for_cause(env, admin, wallet, reason);
                 // Start (or complete) the bounded cascade sweep.
-                Self::run_cascade_sweep(&env, &wallet, 0)?;
+                Self::run_cascade_sweep(env, wallet, 0)?;
             }
         }
 
         Ok(())
+    }
+
+    ///   first batch and stores a cursor; call `continue_revocation_cascade` to
+    ///   finish.
+    ///
+    /// Optionally accepts a reason (max 128 bytes) included in the event and
+    /// stored in the `RevocationRecord`.
+    pub fn revoke_validator(
+        env: Env,
+        wallet: Address,
+        severity: RevocationSeverity,
+        reason: Option<String>,
+    ) -> Result<(), VerificationError> {
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+
+        if let Some(ref r) = reason {
+            if r.len() > 128 {
+                return Err(VerificationError::ReasonTooLong);
+            }
+        }
+        let reason_str = reason.unwrap_or(String::from_str(&env, ""));
+
+        // Confirm the wallet is registered before mutating anything.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Validator(wallet.clone()))
+        {
+            return Err(VerificationError::ValidatorNotFound);
+        }
+
+        // Single-wallet case: rewrite the vector for exactly this wallet.
+        let mut targets: Vec<Address> = Vec::new(&env);
+        targets.push_back(wallet.clone());
+        Self::remove_from_validator_vector(&env, &targets);
+
+        Self::revoke_one(&env, &admin, &wallet, &severity, &reason_str)
     }
 
     /// Continue a for-cause revocation cascade sweep that was interrupted
@@ -935,9 +986,15 @@ impl VerificationContract {
         Ok(())
     }
     /// Revoke multiple validators in a single atomic transaction (admin only).
-    /// Iterates the wallet list and applies the same revoke logic for each,
-    /// emitting one `validator_revoked` event per revocation.
-    /// If a wallet is not found, the entire batch fails (atomicity).
+    /// Applies exactly the same per-validator logic as `revoke_validator` via
+    /// the shared `revoke_one` helper, emitting one `validator_revoked` event
+    /// per revocation.
+    ///
+    /// `ValidatorVector` is loaded and written once for the whole batch.
+    ///
+    /// Fails the entire batch (no state persisted) if any wallet is not
+    /// registered, if the same wallet is listed more than once, or if `reason`
+    /// exceeds 128 bytes.
     ///
     /// All wallets in the batch receive the same `severity` and `reason`.
     /// For `RevocationSeverity::ForCause`, each validator's cascade sweep is
@@ -956,72 +1013,37 @@ impl VerificationContract {
                 return Err(VerificationError::ReasonTooLong);
             }
         }
-
         let reason_str = reason.unwrap_or(String::from_str(&env, ""));
+
+        // Reject a batch that lists the same wallet twice. Clearing the active
+        // flag is idempotent, but a duplicate would still be counted twice by
+        // the `ActiveValidatorCount` decrement in `revoke_one` and would emit a
+        // second set of revocation events, leaving the post-batch accounting
+        // impossible to reason about. Rejecting up front keeps the batch atomic
+        // and its counter exact.
+        for i in 0..wallets.len() {
+            for j in (i + 1)..wallets.len() {
+                if wallets.get(i).unwrap() == wallets.get(j).unwrap() {
+                    return Err(VerificationError::InvalidInput);
+                }
+            }
+        }
+
+        // Every wallet must already be registered, so an unknown wallet fails
+        // the batch before any state is touched.
+        for i in 0..wallets.len() {
+            let wallet = wallets.get(i).unwrap();
+            if !env.storage().persistent().has(&DataKey::Validator(wallet)) {
+                return Err(VerificationError::ValidatorNotFound);
+            }
+        }
+
+        // One load and one store for the whole batch.
+        Self::remove_from_validator_vector(&env, &wallets);
 
         for i in 0..wallets.len() {
             let wallet = wallets.get(i).unwrap();
-
-            let mut validator: Validator = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Validator(wallet.clone()))
-                .ok_or(VerificationError::ValidatorNotFound)?;
-            validator.active = false;
-            env.storage()
-                .persistent()
-                .set(&DataKey::Validator(wallet.clone()), &validator);
-
-            let validator_vector: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ValidatorVector)
-                .unwrap_or_else(|| Vec::new(&env));
-            let mut new_vector: Vec<Address> = Vec::new(&env);
-            for j in 0..validator_vector.len() {
-                let addr = validator_vector.get(j).unwrap();
-                if addr != wallet {
-                    new_vector.push_back(addr);
-                }
-            }
-            env.storage()
-                .persistent()
-                .set(&DataKey::ValidatorVector, &new_vector);
-
-            let invalidated = Self::invalidate_pending_votes_for_validator(&env, &wallet);
-            if invalidated > 0 {
-                events::validator_pending_votes_invalidated(&env, &admin, &wallet, invalidated);
-            }
-
-            // Persist a RevocationRecord for each wallet.
-            let record = RevocationRecord {
-                severity: severity.clone(),
-                reason: reason_str.clone(),
-                revoked_at: env.ledger().timestamp(),
-                admin: admin.clone(),
-            };
-            env.storage()
-                .persistent()
-                .set(&DataKey::RevocationRecord(wallet.clone()), &record);
-            env.storage().persistent().extend_ttl(
-                &DataKey::RevocationRecord(wallet.clone()),
-                PERSISTENT_TTL_MIN,
-                PERSISTENT_TTL_MAX,
-            );
-
-            match severity {
-                RevocationSeverity::Routine => {
-                    events::validator_revoked(&env, &admin, &wallet, &reason_str);
-                }
-                RevocationSeverity::ForCause => {
-                    env.storage()
-                        .persistent()
-                        .set(&DataKey::ValidatorRevokedForCause(wallet.clone()), &true);
-                    events::validator_revoked(&env, &admin, &wallet, &reason_str);
-                    events::validator_revoked_for_cause(&env, &admin, &wallet, &reason_str);
-                    Self::run_cascade_sweep(&env, &wallet, 0)?;
-                }
-            }
+            Self::revoke_one(&env, &admin, &wallet, &severity, &reason_str)?;
         }
 
         Ok(())
