@@ -39,7 +39,7 @@ use scoutchain_shared_types::{
 const MAX_CREDENTIALS_LEN: u32 = 256;
 /// Minimum credentials length for validator registration.
 /// Credentials must contain at least a short certification identifier
-/// (e.g. "UEFA B" = 6 chars) to prevent empty or trivially short strings.
+/// (e.g. "UEFA B Licence" = 14 chars) to prevent empty or trivially short strings.
 const MIN_CREDENTIALS_LEN: u32 = 10;
 const MAX_GLOBAL_MILESTONE_INDEX: u32 = 500;
 
