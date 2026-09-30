@@ -1441,18 +1441,22 @@ impl RegistrationContract {
     }
 
     /// Verify a scout profile (admin only).
+    ///
+    /// Calling this on an already-verified scout is a no-op — `verified_at` is
+    /// not overwritten once set, preventing accidental timestamp resets.
     pub fn verify_scout(env: Env, scout_id: u64) -> Result<(), ScoutChainError> {
-        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         let mut profile: ScoutProfile = env
             .storage()
             .persistent()
             .get(&DataKey::Scout(scout_id))
             .ok_or(ScoutChainError::ScoutNotFound)?;
-        let admin = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .ok_or(ScoutChainError::NotInitialized)?;
+
+        // Idempotent: skip re-verification to avoid overwriting verified_at.
+        if profile.verified {
+            return Ok(());
+        }
+
         profile.verification = ScoutVerificationRecord {
             verified: true,
             verified_by: Some(admin),
@@ -1464,6 +1468,11 @@ impl RegistrationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Scout(scout_id), &profile);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Scout(scout_id),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
         events::scout_verified(&env, scout_id, &profile.wallet);
         Ok(())
     }
