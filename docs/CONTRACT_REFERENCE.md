@@ -5245,6 +5245,7 @@ All events follow the unified `(Symbol, actor)` topic schema introduced in #246.
 | `validator_record_restored` | event_name, admin (Address) | wallet (Address) | `restore_validator_record` re-extended an archived validator record's TTL |
 | `milestone_record_restored` | event_name, admin (Address) | player_id (u64), index (u32) | `restore_milestone_record` re-extended an archived milestone record's TTL |
 | `level_advancement_skipped` | event_name, player_id (u64) | reason (String) | A milestone was recorded but the Level-2+ advance was gated (region-quorum / affiliation-diversity not met) |
+| `level_advancement_deferred` | event_name, player_id (u64) | milestone_index (u32), distinct_affiliations (u32), required (u32) | A milestone was recorded but the level advance was deferred because the player has fewer distinct validator affiliations (`distinct_affiliations`) than the `required` DiversityConfig threshold — UIs can show "needs N more independent validator" |
 | `progress_contract_not_set` | event_name, player_id (u64) | () | Diagnostic: `approve_milestone` reached the cross-call point with no `progress_contract` wired |
 | `progress_call_failed` | event_name, player_id (u64) | error_code (u32) | Diagnostic (transaction receipt only): the cross-contract `advance_level` call returned an error, which aborts the whole transaction |
 

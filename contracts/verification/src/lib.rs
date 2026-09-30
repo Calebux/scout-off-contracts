@@ -254,6 +254,14 @@ impl VerificationContract {
         env.storage().persistent().get(&DataKey::DiversityConfig)
     }
 
+    pub fn get_player_affiliation_count(env: Env, player_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Vec<String>>(&DataKey::PlayerAffiliations(player_id))
+            .unwrap_or_else(|| Vec::new(&env))
+            .len() as u32
+    }
+
     pub fn set_diversity_config(
         env: Env,
         required_distinct_affiliations: u32,
@@ -4082,6 +4090,10 @@ impl VerificationContract {
         }
 
         let diversity_config = Self::get_diversity_config(env.clone());
+        let required_count = diversity_config
+            .as_ref()
+            .map(|c| c.required_distinct_affiliations)
+            .unwrap_or(0u32);
         let mut advance_allowed = true;
         if let Some(config) = diversity_config {
             if next_index >= config.starting_milestone_index
@@ -4122,6 +4134,14 @@ impl VerificationContract {
                 }
             }
         } else {
+            let affiliations_count = player_affiliations.len() as u32;
+            events::level_advancement_deferred(
+                env,
+                player_id,
+                next_index,
+                affiliations_count,
+                required_count,
+            );
             if !env.storage().instance().has(&DataKey::ProgressContract) {
                 events::progress_contract_not_set(env, player_id);
             }
