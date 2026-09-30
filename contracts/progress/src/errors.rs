@@ -61,6 +61,8 @@ pub enum ProgressError {
     /// archival grace period has fully elapsed (evicted, not merely archived)
     /// and is unrecoverable.
     PlayerLevelRecordEvicted = 15,
+    /// No history entry exists at the requested index for this player.
+    HistoryEntryNotFound = 16,
 }
 
 impl AdminError for ProgressError {

@@ -488,7 +488,7 @@ impl ProgressContract {
             .storage()
             .persistent()
             .get(&DataKey::HistoryEntry(player_id, index))
-            .ok_or(ProgressError::PlayerNotFound)?;
+            .ok_or(ProgressError::HistoryEntryNotFound)?;
         env.storage().persistent().extend_ttl(
             &DataKey::HistoryEntry(player_id, index),
             PERSISTENT_TTL_MIN,
@@ -1545,6 +1545,20 @@ mod tests {
         // A player that has never had advance_level called should be Unverified
         let player_id = 42u64;
         assert_eq!(client.get_level(&player_id), ProgressLevel::Unverified);
+    }
+
+    #[test]
+    fn test_get_history_entry_out_of_range_returns_history_entry_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(ProgressContract, ());
+        let client = ProgressContractClient::new(&env, &id);
+        client.initialize(&Address::generate(&env));
+
+        let player_id = 99u64;
+        // No advances made — index 1 does not exist
+        let result = client.try_get_history_entry(&player_id, &1u32);
+        assert_eq!(result, Err(Ok(ProgressError::HistoryEntryNotFound)));
     }
 
     #[test]
