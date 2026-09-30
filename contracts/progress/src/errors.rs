@@ -36,6 +36,12 @@ pub enum ProgressError {
     /// `accept_admin` called before an admin transfer was proposed.
     PendingAdminNotSet = 10,
 
+    // ── No-op guard ──
+    /// `reset_player_level` was called with a target level equal to the
+    /// player's current level. No history entry is written and no state is
+    /// changed. Callers must supply a different target level.
+    NoLevelChange = 11,
+
     // ── Migration ──
     /// Migration window is not currently active on this contract.
     /// Call `open_migration_window` (admin-only) before seeding state.

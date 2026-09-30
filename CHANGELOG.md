@@ -18,6 +18,12 @@ The initial v0.1.0 entry below retains the year-only date because no exact histo
 
 ## Unreleased
 
+- Version: `v1.1.1`
+- Release date: `2026-08-21`
+- Contracts affected: `progress`
+- Summary: Fixed unbounded read cost in three progress contract history readers (issue #1411). `get_progress_history` no longer extends TTL on every page and is documented as deprecated with unbounded cost — callers should migrate to `get_progress_history_page` or `get_history_page_with_cursor`. `get_history_since` now accepts a `limit` parameter and scans at most 10 pages (80 entries) from the newest, bounding CPU/storage cost. `get_history_proof` doc comment updated to accurately describe its linear cost with history length and recommends off-chain computation for large histories.
+- Classification: `Non-breaking (MINOR)` — function signatures for `get_history_since` and `get_progress_history` change in a backward-compatible way (new optional `limit` parameter for `get_history_since`, behavior change only for `get_progress_history` removing TTL writes); existing callers continue to work.
+
 Use the structure below for upcoming MINOR or MAJOR contract changes:
 
 - Version: `vX.Y.Z`
@@ -33,6 +39,24 @@ Use the structure below for upcoming MINOR or MAJOR contract changes:
 - Contracts affected: `registration`, `scout_access`, `verification`
 - Summary: Fixed infinite paging bug where `limit=0` produced a non-advancing cursor. Added `has_more: bool` field to `FilterResult` (registration ABI change). Clamped `limit` to 1..=50 across all paginated getters (`filter_players`, `get_scout_contacts_page`, `list_disputes_page`, `get_global_milestone_index`, `get_validator_milestones_page`, `get_validator_milestones_page_v2`). Documented pagination convention in CONTRACT_REFERENCE.md.
 - Classification: `Breaking (MAJOR)`
+
+---
+
+### [Unreleased] — fix/1412-progress-wiring-state-use-wiring-link
+
+- Contracts affected: `progress`
+- Summary: `progress::get_wiring_state()` now returns `ProgressWiringState`
+  with three `WiringLink { address, epoch }` fields (`registration_contract`,
+  `verification_contract`, `scout_access_contract`) instead of the previous
+  flat representation that had separate `Option<Address>` and `u32` epoch
+  fields. This aligns `progress` with the shared `WiringLink` pattern used
+  by the other three contracts and removes the need for the `flat_link`
+  special-case in `scripts/verify-cross-contract-wiring.sh`.
+- Classification: **Breaking (MAJOR)** — ABI change: callers reading
+  `registration_contract`, `verification_contract`, or `scout_access_contract`
+  as plain addresses (or reading the separate `*_epoch` fields) must update to
+  read `link.address` / `link.epoch` from the returned `WiringLink` object.
+  TypeScript bindings must be regenerated. Fixes #1412.
 
 - Version: `v0.4.0`
 - Release date: `2026-08-19`

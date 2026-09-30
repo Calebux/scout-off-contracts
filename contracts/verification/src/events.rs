@@ -22,6 +22,7 @@ pub const VALIDATOR_PENDING_VOTES_INVALIDATED: &str = "validator_votes_invalidat
 pub const WIRING_UPDATED: &str = "wiring_updated";
 pub const DISPUTE_VOTE_CAST: &str = "dispute_vote_cast";
 pub const DISPUTE_TALLIED: &str = "dispute_tallied";
+pub const ATTESTATION_KEY_REGISTERED: &str = "attestation_key_registered";
 
 /// topics: (event_name, old_admin)  data: new_admin
 pub fn admin_transfer_proposed(env: &Env, old_admin: &Address, new_admin: &Address) {
@@ -64,6 +65,19 @@ pub fn validator_registered(env: &Env, wallet: &Address, credentials: &String) {
     env.events().publish(
         (Symbol::new(env, "validator_registered"), wallet.clone()),
         credentials.clone(),
+    );
+}
+
+/// topics: (event_name, wallet)  data: (public_key, rotated_from)
+pub fn attestation_key_registered(
+    env: &Env,
+    wallet: &Address,
+    public_key: &soroban_sdk::BytesN<32>,
+    rotated_from: &Option<soroban_sdk::BytesN<32>>,
+) {
+    env.events().publish(
+        (Symbol::new(env, ATTESTATION_KEY_REGISTERED), wallet.clone()),
+        (public_key.clone(), rotated_from.clone()),
     );
 }
 
@@ -219,6 +233,28 @@ pub fn level_advancement_skipped(env: &Env, player_id: u64, reason: &String) {
     env.events().publish(
         (Symbol::new(env, "level_advancement_skipped"), player_id),
         reason.clone(),
+    );
+}
+
+/// Emitted when diversity gating blocks level advancement (the milestone is
+/// committed but the player's level has not advanced because they need more
+/// distinct validator affiliations).
+///
+/// topics: (event_name, player_id)  data: (milestone_index, distinct_affiliations, required)
+///
+/// `distinct_affiliations` is the player's current count of distinct validator
+/// affiliations; `required` is the threshold from `DiversityConfig`. UIs can
+/// show "needs 1 more independent validator" from this data.
+pub fn level_advancement_deferred(
+    env: &Env,
+    player_id: u64,
+    milestone_index: u32,
+    distinct_affiliations: u32,
+    required: u32,
+) {
+    env.events().publish(
+        (Symbol::new(env, "level_advancement_deferred"), player_id),
+        (milestone_index, distinct_affiliations, required),
     );
 }
 
