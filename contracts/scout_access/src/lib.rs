@@ -128,6 +128,13 @@ const TRIAL_OFFER_COOLDOWN_SECS: u64 = 86_400; // 24 hours
 const MIN_CONTACT_FEE_STROOPS: i128 = 100_000; // 0.01 XLM
 const MIN_SUB_FEE_STROOPS: i128 = 1_000_000; // 0.1 XLM
 
+// Upper bounds on fee fields to catch misconfigured values (e.g. off-by-one
+// stroops vs XLM, or runaway durations).
+const MAX_CONTACT_FEE_STROOPS: i128 = 100_000_000_000; // 10,000 XLM
+const MAX_SUB_FEE_STROOPS: i128 = 1_000_000_000_000; // 100,000 XLM
+const MAX_SUB_DURATION_SECS: u64 = 365 * 24 * 3600; // 1 year
+const MAX_PRO_CONTACT_LIMIT: u32 = 10_000;
+
 // Fee config proposal activation delay: 7 days (604,800 seconds) at average
 // 5s/ledger ≈ 120,960 ledgers. Scouts have one full week to react to a
 // proposed fee increase before it takes effect.
@@ -3189,24 +3196,68 @@ impl ScoutAccessContract {
         Self::accumulate_fee(env, amount)
     }
 
-    /// Validate that every fee field is positive and durations are non-zero.
+    /// Validate fee configuration fields.
     ///
     /// This is the single authoritative validation entry point for `FeeConfig`.
     /// Both `initialize` and `update_fee_config` call this method, and any
     /// future field added to `FeeConfig` must be validated here.
-    /// Validate that every fee field meets the minimum floor and sub_duration_secs is non-zero.
+    ///
+    /// Rules enforced:
+    /// - All subscription fees must be within `[MIN_SUB_FEE_STROOPS, MAX_SUB_FEE_STROOPS]`.
+    /// - Subscription tier prices must be in ascending order: `basic <= pro <= elite`.
+    /// - `contact_fee_stroops` must be within `[MIN_CONTACT_FEE_STROOPS, MAX_CONTACT_FEE_STROOPS]`.
+    /// - `sub_duration_secs` must be in `(0, MAX_SUB_DURATION_SECS]`.
+    /// - `pro_contact_limit` must be in `[1, MAX_PRO_CONTACT_LIMIT]`.
+    /// - `trial_offer_escrow_stroops` must be `>= 0`; **0 disables trial offers**.
+    /// - `trial_offer_expiry_secs` must be `> 0` when `trial_offer_escrow_stroops > 0`.
     fn validate_fee_config(config: &FeeConfig) -> Result<(), ScoutAccessError> {
-        if config.contact_fee_stroops < MIN_CONTACT_FEE_STROOPS
-            || config.basic_sub_stroops < MIN_SUB_FEE_STROOPS
+        // Floor and ceiling checks for subscription fees
+        if config.basic_sub_stroops < MIN_SUB_FEE_STROOPS
             || config.pro_sub_stroops < MIN_SUB_FEE_STROOPS
             || config.elite_sub_stroops < MIN_SUB_FEE_STROOPS
-            || config.sub_duration_secs == 0
-            || config.trial_offer_escrow_stroops <= 0
-            || config.trial_offer_expiry_secs == 0
-            || config.pro_contact_limit == 0
         {
             return Err(ScoutAccessError::InvalidInput);
         }
+        if config.basic_sub_stroops > MAX_SUB_FEE_STROOPS
+            || config.pro_sub_stroops > MAX_SUB_FEE_STROOPS
+            || config.elite_sub_stroops > MAX_SUB_FEE_STROOPS
+        {
+            return Err(ScoutAccessError::InvalidInput);
+        }
+
+        // Tier price ordering: basic <= pro <= elite
+        if config.basic_sub_stroops > config.pro_sub_stroops
+            || config.pro_sub_stroops > config.elite_sub_stroops
+        {
+            return Err(ScoutAccessError::InvalidInput);
+        }
+
+        // Contact fee bounds
+        if config.contact_fee_stroops < MIN_CONTACT_FEE_STROOPS
+            || config.contact_fee_stroops > MAX_CONTACT_FEE_STROOPS
+        {
+            return Err(ScoutAccessError::InvalidInput);
+        }
+
+        // Subscription duration bounds
+        if config.sub_duration_secs == 0 || config.sub_duration_secs > MAX_SUB_DURATION_SECS {
+            return Err(ScoutAccessError::InvalidInput);
+        }
+
+        // Pro contact limit bounds
+        if config.pro_contact_limit == 0 || config.pro_contact_limit > MAX_PRO_CONTACT_LIMIT {
+            return Err(ScoutAccessError::InvalidInput);
+        }
+
+        // trial_offer_escrow_stroops: 0 means trial offers are disabled (valid);
+        // negative values are rejected; when > 0, expiry must also be set.
+        if config.trial_offer_escrow_stroops < 0 {
+            return Err(ScoutAccessError::InvalidInput);
+        }
+        if config.trial_offer_escrow_stroops > 0 && config.trial_offer_expiry_secs == 0 {
+            return Err(ScoutAccessError::InvalidInput);
+        }
+
         Ok(())
     }
 

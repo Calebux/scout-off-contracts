@@ -124,8 +124,9 @@ pub struct FeeConfig {
     pub elite_sub_stroops: i128,
     /// Subscription duration in seconds (default: 30 days)
     pub sub_duration_secs: u64,
-    /// Trial offer escrow hold amount in stroops.
-    /// Must be > 0 when trial offers are enabled; 0 disables trial offers.
+    /// Escrow amount for trial offers (stroops).
+    /// Set to 0 to disable trial offers entirely; any positive value
+    /// is the amount escrowed per trial offer.
     pub trial_offer_escrow_stroops: i128,
     /// Trial offer expiry window in seconds.
     /// Must be > 0; defines how long an escrowed trial offer remains valid.
