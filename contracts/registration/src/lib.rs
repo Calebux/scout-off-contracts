@@ -378,22 +378,32 @@ impl RegistrationContract {
         // latter live-resolves the level via a cross-call back into the
         // calling progress contract, which is already on the call stack
         // here (it invoked set_player_level) and would trigger a disallowed
-        // contract re-entry. `level` is never persisted on this contract's
-        // own profile record (progress is the single source of truth for
-        // reads), so the previous index bucket isn't known from storage —
-        // remove the player from every level bucket (a no-op for buckets it
-        // isn't in) before adding it to the new one.
+        // contract re-entry. `PlayerLevel` is persisted on this contract's
+        // own profile record (set by `register_player`, `admin_seed_player`,
+        // and this function itself), so the previous index bucket is known
+        // from storage — remove the player only from its previous buckets,
+        // falling back to a full sweep when the stored level is absent
+        // (e.g. a player seeded before PlayerLevel was tracked).
         let mut stored = Self::load_stored_player(&env, player_id)?;
         let region = stored.vitals.region.clone();
 
-        for lvl in [
-            ProgressLevel::Unverified,
-            ProgressLevel::VerifiedIdentity,
-            ProgressLevel::PerformanceMilestones,
-            ProgressLevel::EliteTier,
-        ] {
-            Self::composite_index_remove(&env, &lvl, &region, player_id);
-            Self::level_index_remove(&env, &lvl, player_id);
+        if let Some(prev) = env
+            .storage()
+            .persistent()
+            .get::<_, ProgressLevel>(&DataKey::PlayerLevel(player_id))
+        {
+            Self::composite_index_remove(&env, &prev, &region, player_id);
+            Self::level_index_remove(&env, &prev, player_id);
+        } else {
+            for lvl in [
+                ProgressLevel::Unverified,
+                ProgressLevel::VerifiedIdentity,
+                ProgressLevel::PerformanceMilestones,
+                ProgressLevel::EliteTier,
+            ] {
+                Self::composite_index_remove(&env, &lvl, &region, player_id);
+                Self::level_index_remove(&env, &lvl, player_id);
+            }
         }
         Self::composite_index_add(&env, &level, &region, player_id);
         Self::level_index_add(&env, &level, player_id);
@@ -4268,6 +4278,84 @@ mod tests {
         let record = client.get_scout_verification(&scout_id);
         assert!(record.verified);
         assert!(record.verified_by.is_some());
+    }
+
+    /// When `PlayerLevel` is absent from storage (e.g. a player
+    /// seeded before this field was tracked), `set_player_level`
+    /// must fall back to sweeping all four level buckets and still
+    /// place the player correctly in the new level's buckets.
+    #[test]
+    fn test_set_player_level_fallback_full_sweep() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        let vitals = dummy_vitals(&env);
+        let hashes = vec![&env, String::from_str(&env, "QmTestFallback")];
+        let player_id = client.register_player(&wallet, &vitals, &hashes);
+
+        // Remove the stored PlayerLevel to simulate a pre-tracking player.
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PlayerLevel(player_id));
+
+        let progress_contract = Address::generate(&env);
+        client.set_progress_contract(&progress_contract);
+
+        client.set_player_level(&player_id, &ProgressLevel::VerifiedIdentity);
+
+        // Player must appear in the new level's composite and level buckets.
+        let profile = client.get_player(&player_id);
+        assert_eq!(profile.level, ProgressLevel::VerifiedIdentity);
+
+        let composite_key = DataKey::PlayersByLevelRegion(
+            ProgressLevel::VerifiedIdentity,
+            String::from_str(&env, "West Africa"),
+        );
+        let composite_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&composite_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        assert!(
+            composite_ids.iter().any(|id| id == player_id),
+            "player must be in VerifiedIdentity/West Africa composite bucket"
+        );
+
+        let level_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlayersByLevel(ProgressLevel::VerifiedIdentity))
+            .unwrap_or_else(|| Vec::new(&env));
+        assert!(
+            level_ids.iter().any(|id| id == player_id),
+            "player must be in VerifiedIdentity level index bucket"
+        );
+
+        // Player must NOT remain in any Unverified bucket after the sweep.
+        let unverified_composite: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlayersByLevelRegion(
+                ProgressLevel::Unverified,
+                String::from_str(&env, "West Africa"),
+            ))
+            .unwrap_or_else(|| Vec::new(&env));
+        assert!(
+            !unverified_composite.iter().any(|id| id == player_id),
+            "player must be removed from Unverified composite bucket"
+        );
+
+        let unverified_level: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PlayersByLevel(ProgressLevel::Unverified))
+            .unwrap_or_else(|| Vec::new(&env));
+        assert!(
+            !unverified_level.iter().any(|id| id == player_id),
+            "player must be removed from Unverified level index bucket"
+        );
     }
 
     // -------------------------------------------------------------------------
