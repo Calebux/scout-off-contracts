@@ -5135,6 +5135,28 @@ mod tests {
     }
 
     #[test]
+    fn test_validator_accessible_after_ledger_advancement() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let validator = Address::generate(&env);
+        client.register_validator(
+            &validator,
+            &String::from_str(&env, "Coach"),
+            &String::from_str(&env, "Default Academy"),
+            &Vec::new(&env),
+        );
+
+        // Advance ledger sequence beyond PERSISTENT_TTL_MIN
+        env.ledger().set_sequence_number(env.ledger().sequence() + 600);
+
+        // Validator should still be accessible (TTL was bumped on register)
+        let v = client.get_validator(&validator);
+        assert!(v.active);
+    }
+
+    #[test]
     #[should_panic(expected = "Error(Contract, #13)")]
     fn test_approve_milestone_overflow() {
         let (env, client) = setup();
