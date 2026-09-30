@@ -139,6 +139,12 @@ const FEE_CONFIG_PROPOSAL_DELAY_SECS: u64 = 7 * 24 * 60 * 60; // 604,800 seconds
 // are updated over the contract's lifetime.
 const FEE_CONFIG_HISTORY_CAP: u32 = 5;
 
+// #1418: Hard cap on batch_contact_players input size. Each contact writes two
+// persistent index entries (ScoutContacts + PlayerContacts) and the write-entry
+// budget per transaction is fixed. 20 entries keeps peak write-entry count
+// safely below the protocol limit and makes quota-check cost predictable.
+const BATCH_CONTACT_MAX_SIZE: u32 = 20;
+
 // #1040: EvidenceAccessGrant enumeration is paged in fixed-size shards keyed
 // by (player_id, page_index) rather than one growing Vec per player, so a
 // popular player who has accumulated thousands of grants over time doesn't
@@ -1192,6 +1198,13 @@ impl ScoutAccessContract {
         Self::require_scout_not_deactivated(&env, &scout)?;
 
         let sub = Self::require_active_subscription(&env, &scout)?;
+
+        // #1418: Reject oversized batches before doing any work. Each entry
+        // requires multiple persistent writes; exceeding BATCH_CONTACT_MAX_SIZE
+        // would push past the per-transaction write-entry budget.
+        if player_ids.len() > BATCH_CONTACT_MAX_SIZE {
+            return Err(ScoutAccessError::BatchTooLarge);
+        }
 
         let config = Self::fee_config(&env);
         let mut new_contacts: u32 = 0;

@@ -91,6 +91,8 @@ pub enum ScoutAccessError {
     ScoutNotVerified = 27,
     /// Registration contract is not wired; Pro/Elite subscriptions require it.
     RegistrationContractNotSet = 28,
+    /// batch_contact_players input exceeds the maximum allowed batch size.
+    BatchTooLarge = 40,
 
     // ── Auto-renewal ──
     /// `renew_if_due` was called but auto-renewal is not enabled for this scout.
