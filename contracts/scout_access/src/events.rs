@@ -169,11 +169,11 @@ pub fn subscription_renewed(
     );
 }
 
-/// topics: (event_name, scout)  data: amount
-pub fn subscription_refunded(env: &Env, scout: &Address, amount: i128) {
+/// topics: (event_name, scout)  data: (admin, amount)
+pub fn subscription_refunded(env: &Env, scout: &Address, admin: &Address, amount: i128) {
     env.events().publish(
         (Symbol::new(env, "subscription_refunded"), scout.clone()),
-        amount,
+        (admin.clone(), amount),
     );
 }
 

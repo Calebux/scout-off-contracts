@@ -3726,10 +3726,14 @@ Emergency admin function to return `amount` XLM (stroops) from the contract
 balance to a scout. Use when a scout is accidentally double-charged (e.g. by
 the race condition the upgrade timing guard is designed to prevent).
 
+The scout must have an existing subscription record; refunds to addresses that
+have never subscribed are rejected with `ScoutNotSubscribed`. The admin address
+is included in the emitted `subscription_refunded` event for auditability.
+
 | | |
 |---|---|
 | **Auth** | Admin must sign |
-| **Errors** | `Unauthorized` · `InvalidInput` (amount ≤ 0) |
+| **Errors** | `Unauthorized` · `InvalidInput` (amount ≤ 0) · `ScoutNotSubscribed` (scout has no subscription record) · `InsufficientFee` (amount > contract balance) |
 
 ```bash
 stellar contract invoke --id $SCOUT_ACCESS_CONTRACT_ID \
@@ -5385,7 +5389,7 @@ All events follow the unified `(Symbol, actor)` topic schema introduced in #246.
 | `trial_offer_confirmed` | event_name, scout (Address) | player_id (u64), index (u32) | Player confirms a pending trial offer before its expiry window closes; escrow released |
 | `trial_offer_expired` | event_name, scout (Address) | player_id (u64), index (u32) | Trial offer confirmation window elapsed; escrowed fee refunded to scout |
 | `fees_withdrawn` | event_name, admin (Address) | to (Address), amount (i128), timestamp (u64) | Admin withdraws accumulated fees |
-| `subscription_refunded` | event_name, scout (Address) | amount (i128) | Admin issues emergency refund to a scout |
+| `subscription_refunded` | event_name, scout (Address) | (admin (Address), amount (i128)) | Admin issues emergency refund to a scout |
 | `fee_config_updated` | event_name, admin (Address) | old_config (FeeConfig), new_config (FeeConfig) | Fee configuration changed (emitted by `update_fee_config`, `activate_fee_config`, and `propose_fee_config`'s immediate-decrease path) |
 | `fee_config_proposed` | event_name, admin (Address) | proposed_config (FeeConfig), proposed_at (u64) | Admin proposes a fee change via `propose_fee_config` — always emitted; also accompanied by `fee_config_updated` in the same transaction if the proposal was an immediate decrease |
 | `fee_config_delay_bypassed` | event_name, admin (Address) | old_config (FeeConfig), new_config (FeeConfig) | Emitted only by `update_fee_config`, alongside its own `fee_config_updated`, flagging that this fee change bypassed the 7-day `propose_fee_config`/`activate_fee_config` delay — see [`docs/FEE_CONFIG_PROPOSAL_DESIGN.md`](FEE_CONFIG_PROPOSAL_DESIGN.md#fee_config_delay_bypassed-new-1055) |
