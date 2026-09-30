@@ -705,14 +705,8 @@ impl ScoutAccessContract {
             Self::remove_from_expiry_bucket(&env, &scout, existing.expires_at);
         }
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Subscription(scout.clone()), &sub);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Subscription(scout.clone()),
-            PERSISTENT_TTL_MIN,
-            PERSISTENT_TTL_MAX,
-        );
+        // Persist subscription and update expiry bucket + tier index atomically.
+        Self::write_subscription(&env, &sub);
 
         // Add scout to the day-granularity expiry bucket so
         // get_expiring_subscriptions can page through soon-to-expire
@@ -1845,6 +1839,110 @@ impl ScoutAccessContract {
         Ok(sub)
     }
 
+    /// Return the list of scout addresses in the expiry bucket for `day`
+    /// (Unix timestamp / 86400). Keeper bots use this to find scouts whose
+    /// subscriptions expire around a given day without scanning all records.
+    ///
+    /// Note: scouts that were auto-renewed via `renew_if_due` will have been
+    /// moved out of this bucket; only scouts still expiring on `day` are
+    /// returned.
+    pub fn get_expiring_subscriptions(env: Env, day: u64) -> soroban_sdk::Vec<Address> {
+        Self::bump_instance_ttl(&env);
+        env.storage()
+            .persistent()
+            .get(&DataKey::ExpiryBucket(day))
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
+    }
+
+    /// Auto-renew a scout's subscription if it has expired, charging the same
+    /// tier fee. Moves the scout from the old expiry bucket to the new one so
+    /// `get_expiring_subscriptions` stays accurate across renewal cycles.
+    ///
+    /// Returns `Ok(true)` if the subscription was renewed, `Ok(false)` if it
+    /// has not yet expired.  Returns an error if the scout has no subscription
+    /// or if the fee transfer fails.
+    pub fn renew_if_due(env: Env, scout: Address) -> Result<bool, ScoutAccessError> {
+        Self::bump_instance_ttl(&env);
+        Self::require_not_paused(&env)?;
+        Self::require_initialized(&env)?;
+
+        let existing: Subscription = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Subscription(scout.clone()))
+            .ok_or(ScoutAccessError::ScoutNotSubscribed)?;
+
+        let now = env.ledger().timestamp();
+
+        // Not yet expired — nothing to do.
+        if now <= existing.expires_at {
+            return Ok(false);
+        }
+
+        let config = Self::fee_config(&env);
+        let fee = match &existing.tier {
+            SubscriptionTier::Basic => config.basic_sub_stroops,
+            SubscriptionTier::Pro => config.pro_sub_stroops,
+            SubscriptionTier::Elite => config.elite_sub_stroops,
+        };
+
+        // Charge the renewal fee.
+        Self::collect_fee(&env, &scout, fee)?;
+
+        let expires_at = now
+            .checked_add(config.sub_duration_secs)
+            .ok_or(ScoutAccessError::Overflow)?;
+
+        let renewed = Subscription {
+            scout: scout.clone(),
+            tier: existing.tier.clone(),
+            expires_at,
+            subscribed_at: now,
+        };
+
+        // write_subscription moves scout from old expiry bucket to new one
+        // and updates the tier index.
+        Self::write_subscription(&env, &renewed);
+
+        events::subscription_renewed(&env, &scout, &existing.tier, now, expires_at);
+        events::scout_subscribed(&env, &scout, &existing.tier, fee);
+
+        Ok(true)
+    }
+
+    /// Seed a subscription record directly (admin only). Used for state
+    /// migrations and testnet setup. Maintains expiry buckets and tier
+    /// index via `write_subscription`.
+    pub fn admin_seed_subscription(
+        env: Env,
+        scout: Address,
+        tier: SubscriptionTier,
+        subscribed_at: u64,
+        expires_at: u64,
+    ) -> Result<(), ScoutAccessError> {
+        Self::bump_instance_ttl(&env);
+        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        Self::require_initialized(&env)?;
+
+        if expires_at <= subscribed_at {
+            return Err(ScoutAccessError::InvalidInput);
+        }
+
+        let sub = Subscription {
+            scout: scout.clone(),
+            tier: tier.clone(),
+            expires_at,
+            subscribed_at,
+        };
+
+        // Use the shared writer so expiry buckets + tier index stay consistent.
+        Self::write_subscription(&env, &sub);
+
+        let now = env.ledger().timestamp();
+        events::subscription_created(&env, &scout, &tier, now, expires_at);
+        Ok(())
+    }
+
     /// Recover an archived (or expired-but-not-evicted) subscription entry by
     /// re-extending its TTL to the core-identity policy value (518,400 ledgers).
     ///
@@ -2802,6 +2900,95 @@ impl ScoutAccessContract {
                 }
             }
             env.storage().persistent().set(&key, &new_list);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared subscription writer — ALL paths that persist a Subscription must
+    // call this helper so that tier index and expiry buckets stay consistent.
+    // -------------------------------------------------------------------------
+
+    /// Write `sub` to persistent storage and keep all derived indexes in sync:
+    ///
+    /// * Removes the scout from the **old** expiry bucket and tier index (if a
+    ///   previous subscription exists and differs).
+    /// * Persists the new `Subscription` record.
+    /// * Adds the scout to the **new** expiry bucket (keyed by `expires_at /
+    ///   SECS_PER_DAY`) and the tier index.
+    ///
+    /// Every function that creates or updates a `Subscription` must go through
+    /// this helper — never write `DataKey::Subscription` directly.
+    fn write_subscription(env: &Env, sub: &Subscription) {
+        const SECS_PER_DAY: u64 = 86_400;
+
+        let scout = &sub.scout;
+        let new_day = sub.expires_at / SECS_PER_DAY;
+
+        // Remove scout from old expiry bucket and tier index if upgrading/renewing.
+        if let Some(old) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Subscription>(&DataKey::Subscription(scout.clone()))
+        {
+            let old_day = old.expires_at / SECS_PER_DAY;
+            if old_day != new_day {
+                Self::remove_from_expiry_bucket(env, scout, old_day);
+            }
+            if old.tier != sub.tier {
+                Self::remove_from_tier_index(env, scout, &old.tier);
+            }
+        }
+
+        // Persist the subscription record.
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(scout.clone()), sub);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Subscription(scout.clone()),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
+
+        // Add scout to the new expiry bucket.
+        Self::add_to_expiry_bucket(env, scout, new_day);
+
+        // Add scout to the tier index.
+        Self::add_to_tier_index(env, scout, &sub.tier);
+    }
+
+    /// Add `scout` to the `ExpiryBucket(day)` index (idempotent).
+    fn add_to_expiry_bucket(env: &Env, scout: &Address, day: u64) {
+        let key = DataKey::ExpiryBucket(day);
+        let mut bucket: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(env));
+        if !bucket.contains(scout) {
+            bucket.push_back(scout.clone());
+        }
+        env.storage().persistent().set(&key, &bucket);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+    }
+
+    /// Remove `scout` from the `ExpiryBucket(day)` index.
+    fn remove_from_expiry_bucket(env: &Env, scout: &Address, day: u64) {
+        let key = DataKey::ExpiryBucket(day);
+        if let Some(bucket) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<Address>>(&key)
+        {
+            let mut new_bucket: Vec<Address> = Vec::new(env);
+            for i in 0..bucket.len() {
+                let addr = bucket.get(i).unwrap();
+                if &addr != scout {
+                    new_bucket.push_back(addr);
+                }
+            }
+            env.storage().persistent().set(&key, &new_bucket);
         }
     }
 

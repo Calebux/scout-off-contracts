@@ -232,6 +232,12 @@ pub enum DataKey {
     /// (push on creation) and `confirm_trial_offer` (remove on cleanup) so
     /// `expire_trial_offers` can sweep stale escrows without an off-chain index.
     OutstandingTrialEscrows,
+    /// day-bucket index (Unix timestamp / 86400) → Vec<Address> of scouts
+    /// whose subscription expires within that day. Updated by
+    /// `write_subscription` on every subscription write so that
+    /// `get_expiring_subscriptions` and keeper bots can find scouts
+    /// cheaply without scanning all Subscription records.
+    ExpiryBucket(u64),
     /// Bounded on-chain history of the last N FeeConfig values, oldest-first.
     /// Updated by `update_fee_config`. Exposed via `get_fee_config_history`.
     FeeConfigHistory,
