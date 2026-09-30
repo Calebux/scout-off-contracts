@@ -87,6 +87,7 @@ mod registration_contract {
     #[allow(dead_code)]
     pub trait RegistrationContractClient {
         fn get_scout_by_wallet(env: Env, wallet: Address) -> Result<ScoutProfile, RegClientError>;
+        fn is_scout_deactivated(env: Env, scout_id: u64) -> bool;
     }
 }
 
@@ -161,6 +162,32 @@ pub struct ScoutAccessContract;
 #[contractimpl]
 impl ScoutAccessContract {
     #[inline(always)]
+    /// Check that the scout (identified by wallet) has not been deactivated
+    /// in the registration contract. This is a best-effort cross-contract call:
+    /// if the registration contract is not wired, the check is skipped (graceful
+    /// degradation, matching the Pro-tier verification pattern).
+    fn require_scout_not_deactivated(env: &Env, scout: &Address) -> Result<(), ScoutAccessError> {
+        if let Some(reg_contract_addr) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::RegistrationContract)
+        {
+            let reg_client = registration_contract::Client::new(env, &reg_contract_addr);
+            match reg_client.try_get_scout_by_wallet(scout) {
+                Ok(Ok(profile)) => {
+                    if reg_client.is_scout_deactivated(&profile.scout_id) {
+                        return Err(ScoutAccessError::ScoutDeactivated);
+                    }
+                }
+                _ => {
+                    // Scout not found in registration contract — allow the
+                    // operation (graceful degradation).
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn bump_instance_ttl(env: &Env) {
         env.storage()
             .instance()
@@ -216,6 +243,16 @@ impl ScoutAccessContract {
         Self::bump_instance_ttl(&env);
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         Self::validate_fee_config(&fee_config)?;
+
+        // #1416: If a pending proposal exists, clear it before applying the
+        // direct update so stale proposed values can never overwrite the new
+        // active config once their 7-day window eventually elapses.
+        if env.storage().persistent().has(&DataKey::PendingFeeConfig) {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::PendingFeeConfig);
+            events::fee_config_proposal_cancelled(&env, &admin);
+        }
 
         let old_config = Self::fee_config(&env);
 
@@ -343,6 +380,29 @@ impl ScoutAccessContract {
         Ok(())
     }
 
+    /// Cancel a pending fee configuration proposal.
+    ///
+    /// Removes the stored `PendingFeeConfig` entry without activating it and
+    /// emits a `fee_config_proposal_cancelled` event so indexers can audit the
+    /// withdrawal. Only the admin may call this function.
+    ///
+    /// Returns `NoPendingFeeConfig` if no proposal is currently pending.
+    pub fn cancel_fee_config_proposal(env: Env) -> Result<(), ScoutAccessError> {
+        Self::bump_instance_ttl(&env);
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+
+        if !env.storage().persistent().has(&DataKey::PendingFeeConfig) {
+            return Err(ScoutAccessError::NoPendingFeeConfig);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PendingFeeConfig);
+
+        events::fee_config_proposal_cancelled(&env, &admin);
+        Ok(())
+    }
+
     pub fn withdraw_fees(env: Env, to: Address) -> Result<i128, ScoutAccessError> {
         Self::bump_instance_ttl(&env);
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
@@ -361,12 +421,7 @@ impl ScoutAccessContract {
 
     pub fn pause_contract(env: Env) -> Result<(), ScoutAccessError> {
         Self::bump_instance_ttl(&env);
-        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .ok_or(ScoutAccessError::NotInitialized)?;
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         env.storage().instance().set(&DataKey::Paused, &true);
         events::contract_paused(&env, &admin);
         Ok(())
@@ -374,12 +429,7 @@ impl ScoutAccessContract {
 
     pub fn unpause_contract(env: Env) -> Result<(), ScoutAccessError> {
         Self::bump_instance_ttl(&env);
-        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .ok_or(ScoutAccessError::NotInitialized)?;
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         env.storage().instance().set(&DataKey::Paused, &false);
         events::contract_unpaused(&env, &admin);
         Ok(())
@@ -562,6 +612,9 @@ impl ScoutAccessContract {
         Self::require_initialized(&env)?;
         scout.require_auth();
 
+        // Reject deactivated scouts at all tiers.
+        Self::require_scout_not_deactivated(&env, &scout)?;
+
         let now = env.ledger().timestamp();
 
         // Track whether this is a renewal/upgrade of an existing subscription.
@@ -593,28 +646,32 @@ impl ScoutAccessContract {
             }
         }
 
-        // Sybil resistance: gate Pro-tier subscriptions to verified scouts only.
-        // Basic and Elite tiers remain unrestricted.
-        if tier == SubscriptionTier::Pro {
-            if let Some(reg_contract_addr) = env
+        // Sybil resistance: gate Pro and Elite tier subscriptions to verified
+        // scouts only. Basic tier remains open. Fails closed — if the
+        // registration contract is not wired, Pro and Elite access is denied
+        // rather than silently allowed. (#1417)
+        let tier_requires_verification = tier == SubscriptionTier::Pro
+            || tier == SubscriptionTier::Elite;
+
+        if tier_requires_verification {
+            let reg_contract_addr = env
                 .storage()
                 .instance()
                 .get::<DataKey, Address>(&DataKey::RegistrationContract)
-            {
-                let reg_client = registration_contract::Client::new(&env, &reg_contract_addr);
-                match reg_client.try_get_scout_by_wallet(&scout) {
-                    Ok(Ok(scout_profile)) => {
-                        if !scout_profile.verification.verified {
-                            return Err(ScoutAccessError::ScoutNotVerified);
-                        }
-                    }
-                    _ => {
-                        // Scout not found in registration contract; deny Pro-tier access
+                .ok_or(ScoutAccessError::RegistrationContractNotSet)?;
+
+            let reg_client = registration_contract::Client::new(&env, &reg_contract_addr);
+            match reg_client.try_get_scout_by_wallet(&scout) {
+                Ok(Ok(scout_profile)) => {
+                    if !scout_profile.verification.verified {
                         return Err(ScoutAccessError::ScoutNotVerified);
                     }
                 }
+                _ => {
+                    // Scout not found or call failed — deny access.
+                    return Err(ScoutAccessError::ScoutNotVerified);
+                }
             }
-            // If registration contract is not wired, allow Pro-tier subscription (graceful degradation)
         }
 
         let config = Self::fee_config(&env);
@@ -774,6 +831,9 @@ impl ScoutAccessContract {
         // the same invocation, so this require_auth is both necessary and
         // sufficient to protect against unauthorised charges.
         scout.require_auth();
+
+        // Reject deactivated scouts.
+        Self::require_scout_not_deactivated(&env, &scout)?;
 
         // Check auto-renewal opt-in.
         let auto_renew_enabled: bool = env
@@ -986,6 +1046,9 @@ impl ScoutAccessContract {
         Self::require_pay_to_contact_not_paused(&env)?;
         scout.require_auth();
 
+        // Reject deactivated scouts.
+        Self::require_scout_not_deactivated(&env, &scout)?;
+
         let subscription: Subscription = env
             .storage()
             .persistent()
@@ -1130,6 +1193,10 @@ impl ScoutAccessContract {
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         scout.require_auth();
+
+        // Reject deactivated scouts.
+        Self::require_scout_not_deactivated(&env, &scout)?;
+
         let sub = Self::require_active_subscription(&env, &scout)?;
 
         // #1418: Reject oversized batches before doing any work. Each entry
@@ -1298,6 +1365,9 @@ impl ScoutAccessContract {
         Self::require_not_paused(&env)?;
         Self::require_initialized(&env)?;
         scout.require_auth();
+
+        // Reject deactivated scouts.
+        Self::require_scout_not_deactivated(&env, &scout)?;
 
         validate_cid(&details_hash).map_err(|_| ScoutAccessError::InvalidInput)?;
 
@@ -1531,6 +1601,12 @@ impl ScoutAccessContract {
         match progress_client.try_advance_level(&env.current_contract_address(), &player_id, &index)
         {
             Ok(_) => {}
+            Err(Ok(progress_contract::ProgClientError::AlreadyAtMaxLevel)) => {
+                // #1419: Player is already at the maximum level — treat this as
+                // a successful confirmation. No level change is needed, but the
+                // trial offer should still be recorded as accepted and the
+                // escrow released to avoid locking funds indefinitely.
+            }
             Err(e) => {
                 // Extract numeric error code from the contract error, if any.
                 let code = match &e {

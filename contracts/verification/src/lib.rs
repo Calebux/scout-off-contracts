@@ -39,7 +39,7 @@ use scoutchain_shared_types::{
 const MAX_CREDENTIALS_LEN: u32 = 256;
 /// Minimum credentials length for validator registration.
 /// Credentials must contain at least a short certification identifier
-/// (e.g. "UEFA B" = 6 chars) to prevent empty or trivially short strings.
+/// (e.g. "UEFA B Licence" = 14 chars) to prevent empty or trivially short strings.
 const MIN_CREDENTIALS_LEN: u32 = 10;
 const MAX_GLOBAL_MILESTONE_INDEX: u32 = 500;
 
@@ -60,6 +60,7 @@ const MAX_MILESTONES_PER_PLAYER_PER_VALIDATOR: u32 = 5;
 /// 50 matches the pagination cap used throughout the codebase (e.g.
 /// `get_validator_milestones_page`, `expire_trial_offers`).
 const CASCADE_LIMIT: u32 = 50;
+const MILESTONE_FLAG_PAGE_SIZE: u32 = 50;
 
 // Core identity TTL: 30 days at ~5s/ledger ≈ 518_400 ledgers.
 // Milestone records, validator registrations, and evidence uniqueness data are
@@ -252,6 +253,14 @@ impl VerificationContract {
 
     pub fn get_diversity_config(env: Env) -> Option<DiversityConfig> {
         env.storage().persistent().get(&DataKey::DiversityConfig)
+    }
+
+    pub fn get_player_affiliation_count(env: Env, player_id: u64) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Vec<String>>(&DataKey::PlayerAffiliations(player_id))
+            .unwrap_or_else(|| Vec::new(&env))
+            .len() as u32
     }
 
     pub fn set_diversity_config(
@@ -647,25 +656,57 @@ impl VerificationContract {
     ///   bounded cascade sweep that flags every milestone the validator previously
     ///   approved as `MilestonePendingReReview`.  If the validator has more than
     ///   `CASCADE_LIMIT` (50) prior approvals, the sweep stops after flagging the
-    ///   first batch and stores a cursor; call `continue_revocation_cascade` to
-    ///   finish.
+    /// Remove every wallet in `wallets` from the stored `ValidatorVector` in a
+    /// single load and a single store.
     ///
-    /// Optionally accepts a reason (max 128 bytes) included in the event and
-    /// stored in the `RevocationRecord`.
-    pub fn revoke_validator(
-        env: Env,
-        wallet: Address,
-        severity: RevocationSeverity,
-        reason: Option<String>,
-    ) -> Result<(), VerificationError> {
-        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
-
-        if let Some(ref r) = reason {
-            if r.len() > 128 {
-                return Err(VerificationError::ReasonTooLong);
+    /// Kept separate from `revoke_one` because the cost profile differs by
+    /// entrypoint: the single-wallet path rewrites the vector for one wallet,
+    /// while `batch_revoke_validators` rewrites it once for the whole batch.
+    /// Rewriting per wallet inside the batch made it O(n*m) in the number of
+    /// wallets and the size of the vector.
+    fn remove_from_validator_vector(env: &Env, wallets: &Vec<Address>) {
+        let validator_vector: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ValidatorVector)
+            .unwrap_or_else(|| Vec::new(env));
+        let mut new_vector: Vec<Address> = Vec::new(env);
+        'keep: for i in 0..validator_vector.len() {
+            let addr = validator_vector.get(i).unwrap();
+            for j in 0..wallets.len() {
+                if wallets.get(j).unwrap() == addr {
+                    continue 'keep;
+                }
             }
+            new_vector.push_back(addr);
         }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ValidatorVector, &new_vector);
+    }
 
+    /// Internal per-validator revocation shared by `revoke_validator` and
+    /// `batch_revoke_validators`.
+    ///
+    /// Everything that must stay identical between the single and batch paths
+    /// lives here: clearing the active flag, the `ActiveValidatorCount`
+    /// decrement (skipped when the validator was already inactive), pending-vote
+    /// invalidation, the `RevocationRecord`, and the revocation events
+    /// including the for-cause cascade sweep.
+    ///
+    /// `ValidatorVector` is deliberately *not* touched here — see
+    /// `remove_from_validator_vector` — because the batch path must rewrite it
+    /// once for the entire batch rather than once per wallet.
+    ///
+    /// Returns `ValidatorNotFound` if the wallet is not registered, which
+    /// aborts the whole transaction in the batch case.
+    fn revoke_one(
+        env: &Env,
+        admin: &Address,
+        wallet: &Address,
+        severity: &RevocationSeverity,
+        reason: &String,
+    ) -> Result<(), VerificationError> {
         let mut validator: Validator = env
             .storage()
             .persistent()
@@ -689,35 +730,17 @@ impl VerificationContract {
             );
         }
 
-        let validator_vector: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ValidatorVector)
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut new_vector: Vec<Address> = Vec::new(&env);
-        for i in 0..validator_vector.len() {
-            let addr = validator_vector.get(i).unwrap();
-            if addr != wallet {
-                new_vector.push_back(addr);
-            }
-        }
-        env.storage()
-            .persistent()
-            .set(&DataKey::ValidatorVector, &new_vector);
-
         // Retroactively invalidate this validator's contribution to every
         // still-open (sub-threshold) pending attestation claim.
-        let invalidated = Self::invalidate_pending_votes_for_validator(&env, &wallet);
+        let invalidated = Self::invalidate_pending_votes_for_validator(env, wallet);
         if invalidated > 0 {
-            events::validator_pending_votes_invalidated(&env, &admin, &wallet, invalidated);
+            events::validator_pending_votes_invalidated(env, admin, wallet, invalidated);
         }
-
-        let reason_str = reason.unwrap_or(String::from_str(&env, ""));
 
         // Persist a RevocationRecord for audit purposes.
         let record = RevocationRecord {
             severity: severity.clone(),
-            reason: reason_str.clone(),
+            reason: reason.clone(),
             revoked_at: env.ledger().timestamp(),
             admin: admin.clone(),
         };
@@ -733,20 +756,57 @@ impl VerificationContract {
         // Emit the appropriate revocation event.
         match severity {
             RevocationSeverity::Routine => {
-                events::validator_revoked(&env, &admin, &wallet, &reason_str);
+                events::validator_revoked(env, admin, wallet, reason);
             }
             RevocationSeverity::ForCause => {
                 env.storage()
                     .persistent()
                     .set(&DataKey::ValidatorRevokedForCause(wallet.clone()), &true);
-                events::validator_revoked(&env, &admin, &wallet, &reason_str);
-                events::validator_revoked_for_cause(&env, &admin, &wallet, &reason_str);
+                events::validator_revoked(env, admin, wallet, reason);
+                events::validator_revoked_for_cause(env, admin, wallet, reason);
                 // Start (or complete) the bounded cascade sweep.
-                Self::run_cascade_sweep(&env, &wallet, 0)?;
+                Self::run_cascade_sweep(env, wallet, 0)?;
             }
         }
 
         Ok(())
+    }
+
+    ///   first batch and stores a cursor; call `continue_revocation_cascade` to
+    ///   finish.
+    ///
+    /// Optionally accepts a reason (max 128 bytes) included in the event and
+    /// stored in the `RevocationRecord`.
+    pub fn revoke_validator(
+        env: Env,
+        wallet: Address,
+        severity: RevocationSeverity,
+        reason: Option<String>,
+    ) -> Result<(), VerificationError> {
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+
+        if let Some(ref r) = reason {
+            if r.len() > 128 {
+                return Err(VerificationError::ReasonTooLong);
+            }
+        }
+        let reason_str = reason.unwrap_or(String::from_str(&env, ""));
+
+        // Confirm the wallet is registered before mutating anything.
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Validator(wallet.clone()))
+        {
+            return Err(VerificationError::ValidatorNotFound);
+        }
+
+        // Single-wallet case: rewrite the vector for exactly this wallet.
+        let mut targets: Vec<Address> = Vec::new(&env);
+        targets.push_back(wallet.clone());
+        Self::remove_from_validator_vector(&env, &targets);
+
+        Self::revoke_one(&env, &admin, &wallet, &severity, &reason_str)
     }
 
     /// Continue a for-cause revocation cascade sweep that was interrupted
@@ -803,8 +863,6 @@ impl VerificationContract {
         // validator index, and cursor are included. Store the flags in compact
         // validator-scoped pages instead: one bounded sweep writes at most two
         // page entries while preserving O(1) lookup by the public getter.
-        const FLAG_PAGE_SIZE: u32 = 50;
-
         let milestones_key = DataKey::ValidatorMilestones(wallet.clone());
         let milestones: Vec<MilestoneRef> = env
             .storage()
@@ -817,7 +875,7 @@ impl VerificationContract {
         let mut i = start_index;
         let count_key = DataKey::MilestonePendingReReviewCount(wallet.clone());
         let mut pending_count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        let mut page_index = pending_count / FLAG_PAGE_SIZE;
+        let mut page_index = pending_count / MILESTONE_FLAG_PAGE_SIZE;
         let mut page: Vec<MilestoneRef> = env
             .storage()
             .persistent()
@@ -832,7 +890,7 @@ impl VerificationContract {
         // milestone, which is what previously exhausted transaction limits.
         let mut existing: Vec<MilestoneRef> = Vec::new(env);
         if start_index == 0 && pending_count > 0 {
-            let page_count = pending_count.div_ceil(FLAG_PAGE_SIZE);
+            let page_count = pending_count.div_ceil(MILESTONE_FLAG_PAGE_SIZE);
             for p in 0..page_count {
                 if let Some(entries) = env
                     .storage()
@@ -863,7 +921,7 @@ impl VerificationContract {
             }
 
             if !already_flagged {
-                if page.len() >= FLAG_PAGE_SIZE {
+                if page.len() >= MILESTONE_FLAG_PAGE_SIZE {
                     env.storage().persistent().set(
                         &DataKey::MilestonePendingReReviewPage(wallet.clone(), page_index),
                         &page,
@@ -928,9 +986,15 @@ impl VerificationContract {
         Ok(())
     }
     /// Revoke multiple validators in a single atomic transaction (admin only).
-    /// Iterates the wallet list and applies the same revoke logic for each,
-    /// emitting one `validator_revoked` event per revocation.
-    /// If a wallet is not found, the entire batch fails (atomicity).
+    /// Applies exactly the same per-validator logic as `revoke_validator` via
+    /// the shared `revoke_one` helper, emitting one `validator_revoked` event
+    /// per revocation.
+    ///
+    /// `ValidatorVector` is loaded and written once for the whole batch.
+    ///
+    /// Fails the entire batch (no state persisted) if any wallet is not
+    /// registered, if the same wallet is listed more than once, or if `reason`
+    /// exceeds 128 bytes.
     ///
     /// All wallets in the batch receive the same `severity` and `reason`.
     /// For `RevocationSeverity::ForCause`, each validator's cascade sweep is
@@ -949,72 +1013,37 @@ impl VerificationContract {
                 return Err(VerificationError::ReasonTooLong);
             }
         }
-
         let reason_str = reason.unwrap_or(String::from_str(&env, ""));
+
+        // Reject a batch that lists the same wallet twice. Clearing the active
+        // flag is idempotent, but a duplicate would still be counted twice by
+        // the `ActiveValidatorCount` decrement in `revoke_one` and would emit a
+        // second set of revocation events, leaving the post-batch accounting
+        // impossible to reason about. Rejecting up front keeps the batch atomic
+        // and its counter exact.
+        for i in 0..wallets.len() {
+            for j in (i + 1)..wallets.len() {
+                if wallets.get(i).unwrap() == wallets.get(j).unwrap() {
+                    return Err(VerificationError::InvalidInput);
+                }
+            }
+        }
+
+        // Every wallet must already be registered, so an unknown wallet fails
+        // the batch before any state is touched.
+        for i in 0..wallets.len() {
+            let wallet = wallets.get(i).unwrap();
+            if !env.storage().persistent().has(&DataKey::Validator(wallet)) {
+                return Err(VerificationError::ValidatorNotFound);
+            }
+        }
+
+        // One load and one store for the whole batch.
+        Self::remove_from_validator_vector(&env, &wallets);
 
         for i in 0..wallets.len() {
             let wallet = wallets.get(i).unwrap();
-
-            let mut validator: Validator = env
-                .storage()
-                .persistent()
-                .get(&DataKey::Validator(wallet.clone()))
-                .ok_or(VerificationError::ValidatorNotFound)?;
-            validator.active = false;
-            env.storage()
-                .persistent()
-                .set(&DataKey::Validator(wallet.clone()), &validator);
-
-            let validator_vector: Vec<Address> = env
-                .storage()
-                .persistent()
-                .get(&DataKey::ValidatorVector)
-                .unwrap_or_else(|| Vec::new(&env));
-            let mut new_vector: Vec<Address> = Vec::new(&env);
-            for j in 0..validator_vector.len() {
-                let addr = validator_vector.get(j).unwrap();
-                if addr != wallet {
-                    new_vector.push_back(addr);
-                }
-            }
-            env.storage()
-                .persistent()
-                .set(&DataKey::ValidatorVector, &new_vector);
-
-            let invalidated = Self::invalidate_pending_votes_for_validator(&env, &wallet);
-            if invalidated > 0 {
-                events::validator_pending_votes_invalidated(&env, &admin, &wallet, invalidated);
-            }
-
-            // Persist a RevocationRecord for each wallet.
-            let record = RevocationRecord {
-                severity: severity.clone(),
-                reason: reason_str.clone(),
-                revoked_at: env.ledger().timestamp(),
-                admin: admin.clone(),
-            };
-            env.storage()
-                .persistent()
-                .set(&DataKey::RevocationRecord(wallet.clone()), &record);
-            env.storage().persistent().extend_ttl(
-                &DataKey::RevocationRecord(wallet.clone()),
-                PERSISTENT_TTL_MIN,
-                PERSISTENT_TTL_MAX,
-            );
-
-            match severity {
-                RevocationSeverity::Routine => {
-                    events::validator_revoked(&env, &admin, &wallet, &reason_str);
-                }
-                RevocationSeverity::ForCause => {
-                    env.storage()
-                        .persistent()
-                        .set(&DataKey::ValidatorRevokedForCause(wallet.clone()), &true);
-                    events::validator_revoked(&env, &admin, &wallet, &reason_str);
-                    events::validator_revoked_for_cause(&env, &admin, &wallet, &reason_str);
-                    Self::run_cascade_sweep(&env, &wallet, 0)?;
-                }
-            }
+            Self::revoke_one(&env, &admin, &wallet, &severity, &reason_str)?;
         }
 
         Ok(())
@@ -1098,11 +1127,25 @@ impl VerificationContract {
             .get(&DataKey::ValidatorVector)
             .unwrap_or_else(|| Vec::new(&env));
 
+        // Read counters once before the loop; the validation pass guarantees
+        // none of the entries will fail, so we can safely add `batch_len` to
+        // each and write back once after the loop rather than once per entry.
+        let active_count_before: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveValidatorCount)
+            .unwrap_or(0u32);
+        let total_count_before: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalValidatorCount)
+            .unwrap_or(0u32);
+
         for i in 0..entries.len() {
             let (wallet, credentials, affiliation, specializations) = entries.get(i).unwrap();
-            if affiliation.len() > MAX_CREDENTIALS_LEN {
-                return Err(VerificationError::InvalidInput);
-            }
+            // NOTE: the redundant affiliation length check that was previously
+            // duplicated here has been removed; the validation pass above
+            // already enforces this constraint before any state is mutated.
             let validator = Validator {
                 wallet: wallet.clone(),
                 credentials: credentials.clone(),
@@ -1122,30 +1165,20 @@ impl VerificationContract {
             );
             validator_vector.push_back(wallet.clone());
 
-            // Increment active validator count.
-            let active_count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::ActiveValidatorCount)
-                .unwrap_or(0u32);
-            env.storage().instance().set(
-                &DataKey::ActiveValidatorCount,
-                &safe_add_u32(active_count, 1).map_err(|_| VerificationError::Overflow)?,
-            );
-
-            // Increment total validator count.
-            let total_count: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::TotalValidatorCount)
-                .unwrap_or(0u32);
-            env.storage().instance().set(
-                &DataKey::TotalValidatorCount,
-                &safe_add_u32(total_count, 1).map_err(|_| VerificationError::Overflow)?,
-            );
-
             events::validator_registered(&env, &wallet, &validator.credentials);
         }
+
+        // Write both counters once for the entire batch.
+        env.storage().instance().set(
+            &DataKey::ActiveValidatorCount,
+            &safe_add_u32(active_count_before, batch_len)
+                .map_err(|_| VerificationError::Overflow)?,
+        );
+        env.storage().instance().set(
+            &DataKey::TotalValidatorCount,
+            &safe_add_u32(total_count_before, batch_len)
+                .map_err(|_| VerificationError::Overflow)?,
+        );
 
         // Persist updated vector.
         env.storage()
@@ -1420,26 +1453,14 @@ impl VerificationContract {
     }
 
     pub fn pause_contract(env: Env) -> Result<(), VerificationError> {
-        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .ok_or(VerificationError::NotInitialized)?;
-
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         env.storage().instance().set(&DataKey::Paused, &true);
         events::contract_paused(&env, &admin);
         Ok(())
     }
 
     pub fn unpause_contract(env: Env) -> Result<(), VerificationError> {
-        require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
-        let admin: Address = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Admin)
-            .ok_or(VerificationError::NotInitialized)?;
-
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         env.storage().instance().set(&DataKey::Paused, &false);
         events::contract_unpaused(&env, &admin);
         Ok(())
@@ -1890,13 +1911,14 @@ impl VerificationContract {
             return Err(VerificationError::InvalidInput);
         }
 
-        // Wallet must already be a registered validator.
-        if !env
+        // Wallet must already be an active validator.
+        let validator: Validator = env
             .storage()
             .persistent()
-            .has(&DataKey::Validator(wallet.clone()))
-        {
-            return Err(VerificationError::ValidatorNotFound);
+            .get(&DataKey::Validator(wallet.clone()))
+            .ok_or(VerificationError::ValidatorNotFound)?;
+        if !validator.active {
+            return Err(VerificationError::ValidatorInactive);
         }
 
         // If this pubkey was previously bound to another wallet, reject.
@@ -1910,8 +1932,8 @@ impl VerificationContract {
             }
         }
 
-        // Clear previous reverse index if rotating keys.
-        if let Some(old_key) = env
+        // Clear the previous reverse index if rotating keys.
+        let rotated_from = if let Some(old_key) = env
             .storage()
             .persistent()
             .get::<DataKey, BytesN<32>>(&DataKey::AttestationKey(wallet.clone()))
@@ -1919,9 +1941,14 @@ impl VerificationContract {
             if old_key != public_key {
                 env.storage()
                     .persistent()
-                    .remove(&DataKey::AttestationKeyOwner(old_key));
+                    .remove(&DataKey::AttestationKeyOwner(old_key.clone()));
+                Some(old_key)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         env.storage()
             .persistent()
@@ -1939,6 +1966,7 @@ impl VerificationContract {
             PERSISTENT_TTL_MIN,
             PERSISTENT_TTL_MAX,
         );
+        events::attestation_key_registered(&env, &wallet, &public_key, &rotated_from);
         Ok(())
     }
 
@@ -2416,10 +2444,18 @@ impl VerificationContract {
     /// > **Deprecated**: this legacy method is unbounded.  High-volume callers
     /// should use [`get_validator_players_page`] to keep response sizes bounded.
     pub fn get_validator_players(env: Env, wallet: Address) -> Vec<u64> {
-        env.storage()
+        let key = DataKey::ValidatorPlayers(wallet);
+        let list: Vec<u64> = env
+            .storage()
             .persistent()
-            .get(&DataKey::ValidatorPlayers(wallet))
-            .unwrap_or_else(|| Vec::new(&env))
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !list.is_empty() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
+        list
     }
 
     /// Return a bounded, paginated page of distinct player IDs for which
@@ -2442,11 +2478,17 @@ impl VerificationContract {
         offset: u32,
         limit: u32,
     ) -> ValidatorPlayersPage {
+        let key = DataKey::ValidatorPlayers(wallet);
         let list: Vec<u64> = env
             .storage()
             .persistent()
-            .get(&DataKey::ValidatorPlayers(wallet))
+            .get(&key)
             .unwrap_or_else(|| Vec::new(&env));
+        if !list.is_empty() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
+        }
 
         let total = list.len();
         let cap = limit.min(50);
@@ -3006,7 +3048,7 @@ impl VerificationContract {
         // Check if dispute already exists
         let dispute_key = DataKey::MilestoneDispute(player_id, milestone_index);
         if env.storage().persistent().has(&dispute_key) {
-            return Err(VerificationError::InvalidInput);
+            return Err(VerificationError::DisputeAlreadyExists);
         }
 
         // Snapshot the jury configuration at filing time so later admin
@@ -3516,7 +3558,7 @@ impl VerificationContract {
             .persistent()
             .get(&DataKey::MilestonePendingReReviewCount(wallet.clone()))
             .unwrap_or(0);
-        let page_count = count.div_ceil(50);
+        let page_count = count.div_ceil(MILESTONE_FLAG_PAGE_SIZE);
         for page_index in 0..page_count {
             if let Some(page) = env
                 .storage()
@@ -3592,7 +3634,7 @@ impl VerificationContract {
         let wallet = milestone.validator;
         let count_key = DataKey::MilestonePendingReReviewCount(wallet.clone());
         let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        let page_count = count.div_ceil(50);
+        let page_count = count.div_ceil(MILESTONE_FLAG_PAGE_SIZE);
         let mut cleared = false;
         for page_index in 0..page_count {
             let page_key = DataKey::MilestonePendingReReviewPage(wallet.clone(), page_index);
@@ -3968,6 +4010,9 @@ impl VerificationContract {
             &vp_key,
             &(safe_add_u32(vp_count, 1).map_err(|_| VerificationError::Overflow)?),
         );
+        env.storage()
+            .persistent()
+            .extend_ttl(&vp_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
 
         let vp_index_key = DataKey::ValidatorPlayers(validator_wallet.clone());
         let mut vp_players: Vec<u64> = env
@@ -3978,6 +4023,9 @@ impl VerificationContract {
         if !vp_players.contains(player_id) {
             vp_players.push_back(player_id);
             env.storage().persistent().set(&vp_index_key, &vp_players);
+            env.storage()
+                .persistent()
+                .extend_ttl(&vp_index_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
         }
 
         let total: u32 = env
@@ -4031,6 +4079,9 @@ impl VerificationContract {
         env.storage()
             .persistent()
             .set(&validator_milestones_key, &validator_milestones);
+        env.storage()
+            .persistent()
+            .extend_ttl(&validator_milestones_key, PERSISTENT_TTL_MIN, PERSISTENT_TTL_MAX);
 
         events::milestone_approved(
             env,
@@ -4059,9 +4110,18 @@ impl VerificationContract {
                 &DataKey::PlayerAffiliations(player_id),
                 &player_affiliations,
             );
+            env.storage().persistent().extend_ttl(
+                &DataKey::PlayerAffiliations(player_id),
+                PERSISTENT_TTL_MIN,
+                PERSISTENT_TTL_MAX,
+            );
         }
 
         let diversity_config = Self::get_diversity_config(env.clone());
+        let required_count = diversity_config
+            .as_ref()
+            .map(|c| c.required_distinct_affiliations)
+            .unwrap_or(0u32);
         let mut advance_allowed = true;
         if let Some(config) = diversity_config {
             if next_index >= config.starting_milestone_index
@@ -4102,6 +4162,14 @@ impl VerificationContract {
                 }
             }
         } else {
+            let affiliations_count = player_affiliations.len() as u32;
+            events::level_advancement_deferred(
+                env,
+                player_id,
+                next_index,
+                affiliations_count,
+                required_count,
+            );
             if !env.storage().instance().has(&DataKey::ProgressContract) {
                 events::progress_contract_not_set(env, player_id);
             }
@@ -4794,6 +4862,83 @@ mod tests {
         client.revoke_validator(&validator, &RevocationSeverity::Routine, &reason);
 
         assert!(!client.is_active_validator(&validator));
+    }
+
+    #[test]
+    fn test_register_attestation_key_emits_registration_and_rotation_events() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        client.register_validator(
+            &wallet,
+            &String::from_str(&env, "UEFA-B-License"),
+            &String::from_str(&env, "Default Academy"),
+            &Vec::new(&env),
+        );
+
+        let first_key = BytesN::from_array(&env, &[1u8; 32]);
+        let second_key = BytesN::from_array(&env, &[2u8; 32]);
+        let events_before_registration = env.events().all().len();
+        client.register_attestation_key(&wallet, &first_key);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), events_before_registration + 1);
+        assert_eq!(
+            events.get(events_before_registration).unwrap(),
+            (
+                client.address.clone(),
+                (
+                    Symbol::new(&env, crate::events::ATTESTATION_KEY_REGISTERED),
+                    wallet.clone(),
+                )
+                    .into_val(&env),
+                (first_key.clone(), None::<BytesN<32>>).into_val(&env),
+            )
+        );
+
+        let events_before_rotation = events.len();
+        client.register_attestation_key(&wallet, &second_key);
+
+        let events = env.events().all();
+        assert_eq!(events.len(), events_before_rotation + 1);
+        assert_eq!(
+            events.get(events_before_rotation).unwrap(),
+            (
+                client.address.clone(),
+                (
+                    Symbol::new(&env, crate::events::ATTESTATION_KEY_REGISTERED),
+                    wallet.clone(),
+                )
+                    .into_val(&env),
+                (second_key, Some(first_key)).into_val(&env),
+            )
+        );
+    }
+
+    #[test]
+    fn test_register_attestation_key_rejects_inactive_validator() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let wallet = Address::generate(&env);
+        client.register_validator(
+            &wallet,
+            &String::from_str(&env, "UEFA-B-License"),
+            &String::from_str(&env, "Default Academy"),
+            &Vec::new(&env),
+        );
+        let reason: Option<String> = None;
+        client.revoke_validator(&wallet, &RevocationSeverity::Routine, &reason);
+
+        let public_key = BytesN::from_array(&env, &[3u8; 32]);
+        let result = client.try_register_attestation_key(&wallet, &public_key);
+        assert!(matches!(
+            result,
+            Ok(Err(VerificationError::ValidatorInactive))
+        ));
     }
 
     #[test]
@@ -6690,6 +6835,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_is_milestone_flagged_reads_second_page() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        let validator = Address::generate(&env);
+        client.register_validator(
+            &validator,
+            &String::from_str(&env, "Academy Director"),
+            &String::from_str(&env, "Default Academy"),
+            &Vec::new(&env),
+        );
+
+        for player_id in 1u64..=MILESTONE_FLAG_PAGE_SIZE as u64 + 1 {
+            let evidence = valid_cid_v1_for_seed(&env, player_id);
+            client.approve_milestone(
+                &validator,
+                &player_id,
+                &String::from_str(&env, "approved"),
+                &evidence,
+                &None,
+            );
+        }
+
+        client.revoke_validator(
+            &validator,
+            &RevocationSeverity::ForCause,
+            &Some(String::from_str(&env, "Misconduct")),
+        );
+        assert!(client.is_milestone_flagged(&1u64, &1u32));
+        assert!(!client.is_milestone_flagged(
+            &(MILESTONE_FLAG_PAGE_SIZE as u64 + 1),
+            &1u32
+        ));
+
+        client.continue_revocation_cascade(&validator);
+
+        assert!(client.is_milestone_flagged(&1u64, &1u32));
+        assert!(client.is_milestone_flagged(
+            &(MILESTONE_FLAG_PAGE_SIZE as u64 + 1),
+            &1u32
+        ));
+    }
+
     // -------------------------------------------------------------------------
     // get_validator_statuses batch query tests (#850)
     // -------------------------------------------------------------------------
@@ -7110,5 +7300,60 @@ mod tests {
             &None,
         );
         assert_eq!(idx, 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // dispute_milestone: DisputeAlreadyExists test (#1452)
+    // -------------------------------------------------------------------------
+
+    /// Filing a second dispute on the same (player_id, milestone_index) must
+    /// return `DisputeAlreadyExists` (code 32), not the generic `InvalidInput`.
+    #[test]
+    fn test_duplicate_dispute_returns_dispute_already_exists() {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let player_wallet = Address::generate(&env);
+        client.initialize(&admin);
+        setup_with_registration(&env, &client, &player_wallet);
+
+        let validator = Address::generate(&env);
+        client.register_validator(
+            &validator,
+            &String::from_str(&env, "UEFA-B-License"),
+            &String::from_str(&env, "Default Academy"),
+            &Vec::new(&env),
+        );
+
+        client.approve_milestone(
+            &validator,
+            &1u64,
+            &String::from_str(&env, "First milestone"),
+            &String::from_str(&env, VALID_CID_V0),
+            &None,
+        );
+
+        // First dispute — should succeed.
+        client.dispute_milestone(
+            &player_wallet,
+            &1u64,
+            &1u32,
+            &String::from_str(&env, "I dispute this"),
+            &0u32,
+        );
+
+        // Second dispute on the same (player_id=1, milestone_index=1) must
+        // return the distinct DisputeAlreadyExists error, not InvalidInput.
+        let result = client.try_dispute_milestone(
+            &player_wallet,
+            &1u64,
+            &1u32,
+            &String::from_str(&env, "Trying again"),
+            &0u32,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(VerificationError::DisputeAlreadyExists)),
+            "duplicate dispute must return DisputeAlreadyExists (code 32)"
+        );
     }
 }

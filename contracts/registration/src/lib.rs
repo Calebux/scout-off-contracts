@@ -15,7 +15,7 @@ use types::{
 };
 
 pub use errors::ScoutChainError;
-pub use types::{MigrationAuthorization, MigrationRole};
+pub use types::{MigrationAuthorization, MigrationRole, ScoutStatus};
 // `PlayerVitals` is an *input* type of the public `register_player` function, so
 // it must be nameable by external callers (integration tests, generated
 // clients). Re-export it at the crate root; this also brings it into local
@@ -74,11 +74,125 @@ const PERSISTENT_TTL_MAX: u32 = 518_400;
 const ADMIN_BUMP_LEDGERS: u32 = 518_400;
 
 /// Default registration cooldown: 24 hours in seconds.
-/// Applies to register_player, register_scout, and register_validator.
+/// Applies to `register_player` and `register_scout`.
 /// Configurable by admin via `set_reg_cooldown`.  0 disables the cooldown.
+/// Maximum value is 7 days (604_800 seconds).
 const DEFAULT_REG_COOLDOWN_SECS: u64 = 86_400;
 
+/// Maximum allowed registration cooldown: 7 days in seconds.
+const MAX_REG_COOLDOWN_SECS: u64 = 7 * 24 * 60 * 60;
+
 const CONTRACT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Canonicalize a region string to ISO 3166-1 alpha-2 + optional ISO 3166-2 subdivision.
+/// Format: `[A-Z]{2}(-[A-Z0-9]{1,3})?` (e.g., "NG", "NG-LA", "US-CA").
+/// - Trims whitespace
+/// - Uppercases the string
+/// - Validates against the canonical format
+fn canonicalize_region(env: &Env, region: &String) -> Result<String, ScoutChainError> {
+    let trimmed = region.trim();
+    let upper = trimmed.to_uppercase();
+
+    // Validate format: ISO 3166-1 alpha-2 (2 letters) + optional ISO 3166-2 subdivision (1-3 alphanumeric)
+    let bytes = upper.as_bytes();
+    if bytes.len() < 2 || bytes.len() > 6 {
+        // Min: "AA" (2), Max: "AA-AAA" (6)
+        return Err(ScoutChainError::InvalidInput);
+    }
+
+    // First two chars must be A-Z
+    if !bytes[0].is_ascii_uppercase() || !bytes[1].is_ascii_uppercase() {
+        return Err(ScoutChainError::InvalidInput);
+    }
+
+    // If there's a subdivision, it must start with '-' and have 1-3 alphanumeric chars
+    if bytes.len() > 2 {
+        if bytes[2] != b'-' {
+            return Err(ScoutChainError::InvalidInput);
+        }
+        if bytes.len() < 4 || bytes.len() > 6 {
+            return Err(ScoutChainError::InvalidInput);
+        }
+        for &b in &bytes[3..] {
+            if !b.is_ascii_alphanumeric() {
+                return Err(ScoutChainError::InvalidInput);
+            }
+        }
+    }
+
+    Ok(String::from_str(env, core::str::from_utf8(bytes).unwrap()))
+}
+
+/// Canonicalize a position string to a standard format.
+/// - Trims whitespace
+/// - Uppercases the string
+/// - Validates against known position codes (GK, CB, FB, DM, CM, AM, W, ST, etc.)
+fn canonicalize_position(env: &Env, position: &String) -> Result<String, ScoutChainError> {
+    let trimmed = position.trim();
+    let upper = trimmed.to_uppercase();
+
+    let bytes = upper.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_STRING_LEN as usize {
+        return Err(ScoutChainError::InvalidInput);
+    }
+
+    // Validate against known position codes (case-insensitive match)
+    // Common football positions: GK, CB, LB, RB, FB, DM, CM, AM, LM, RM, LW, RW, W, ST, CF
+    let valid_positions = [
+        b"GK", b"CB", b"LB", b"RB", b"FB", b"DM", b"CM", b"AM", b"LM", b"RM",
+        b"LW", b"RW", b"W", b"ST", b"CF", b"SS", b"WB", b"SW",
+    ];
+
+    let mut valid = false;
+    for pos in valid_positions {
+        if bytes == pos {
+            valid = true;
+            break;
+        }
+    }
+
+    if !valid {
+        return Err(ScoutChainError::InvalidInput);
+    }
+
+    Ok(String::from_str(env, core::str::from_utf8(bytes).unwrap()))
+}
+
+/// Canonicalize a nationality string to ISO 3166-1 alpha-2.
+/// - Trims whitespace
+/// - Uppercases the string
+/// - Validates exactly 2 uppercase letters
+fn canonicalize_nationality(env: &Env, nationality: &String) -> Result<String, ScoutChainError> {
+    let trimmed = nationality.trim();
+    let upper = trimmed.to_uppercase();
+
+    let bytes = upper.as_bytes();
+    if bytes.len() != 2 {
+        return Err(ScoutChainError::InvalidInput);
+    }
+
+    if !bytes[0].is_ascii_uppercase() || !bytes[1].is_ascii_uppercase() {
+        return Err(ScoutChainError::InvalidInput);
+    }
+
+    Ok(String::from_str(env, core::str::from_utf8(bytes).unwrap()))
+}
+
+/// Normalize a filter input (region or position) for query matching.
+/// Uses the same canonicalization logic but allows empty strings (meaning "no filter").
+fn normalize_filter_region(env: &Env, region: &String) -> Result<String, ScoutChainError> {
+    if region.is_empty() {
+        return Ok(String::from_str(env, ""));
+    }
+    canonicalize_region(env, region)
+}
+
+fn normalize_filter_position(env: &Env, position: &String) -> Result<String, ScoutChainError> {
+    if position.is_empty() {
+        return Ok(String::from_str(env, ""));
+    }
+    canonicalize_position(env, position)
+}
 
 #[contract]
 pub struct RegistrationContract;
@@ -164,6 +278,35 @@ impl RegistrationContract {
         require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
         env.storage().instance().set(&DataKey::Paused, &false);
         Ok(())
+    }
+
+    /// Set the per-wallet registration cooldown in seconds (admin only).
+    /// Pass `0` to disable the cooldown entirely.
+    /// Bounds: `0..=604_800` (7 days).
+    pub fn set_reg_cooldown(env: Env, cooldown_secs: u64) -> Result<(), ScoutChainError> {
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        if cooldown_secs > MAX_REG_COOLDOWN_SECS {
+            return Err(ScoutChainError::InvalidCooldown);
+        }
+        let old = env
+            .storage()
+            .instance()
+            .get(&DataKey::RegCooldownSecs(0))
+            .unwrap_or(DEFAULT_REG_COOLDOWN_SECS);
+        env.storage()
+            .instance()
+            .set(&DataKey::RegCooldownSecs(0), &cooldown_secs);
+        events::reg_cooldown_updated(&env, &admin, old, cooldown_secs);
+        Ok(())
+    }
+
+    /// Return the current registration cooldown in seconds.
+    /// Returns `DEFAULT_REG_COOLDOWN_SECS` (24h) if no override has been set.
+    pub fn get_reg_cooldown(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RegCooldownSecs(0))
+            .unwrap_or(DEFAULT_REG_COOLDOWN_SECS)
     }
 
     /// Upgrade the contract WASM. Admin auth required.
@@ -265,7 +408,7 @@ impl RegistrationContract {
             PERSISTENT_TTL_MIN,
             PERSISTENT_TTL_MAX,
         );
-        events::player_level_synced(&env, player_id, &progress_contract);
+        events::player_level_synced(&env, player_id, &progress_contract, &level);
         Ok(())
     }
 
@@ -315,13 +458,18 @@ impl RegistrationContract {
             return Err(ScoutChainError::InvalidInput);
         }
 
-        // Validate vitals string lengths
+        // Validate vitals string lengths (pre-canonicalization bounds)
         if vitals.position.len() > MAX_STRING_LEN
             || vitals.region.len() > MAX_REGION_LEN
             || vitals.nationality.len() > MAX_STRING_LEN
         {
             return Err(ScoutChainError::InvalidInput);
         }
+
+        // Canonicalize and validate vitals fields
+        let canon_position = canonicalize_position(&env, &vitals.position)?;
+        let canon_region = canonicalize_region(&env, &vitals.region)?;
+        let canon_nationality = canonicalize_nationality(&env, &vitals.nationality)?;
 
         // Validate age upper bound
         if vitals.age > MAX_PLAYER_AGE {
@@ -339,7 +487,12 @@ impl RegistrationContract {
         let profile = StoredPlayerProfile {
             player_id,
             wallet: wallet.clone(),
-            vitals,
+            vitals: PlayerVitals {
+                age: vitals.age,
+                position: canon_position,
+                region: canon_region,
+                nationality: canon_nationality,
+            },
             ipfs_hashes,
             registered_at: now,
             updated_at: now,
@@ -484,6 +637,43 @@ impl RegistrationContract {
         Ok(())
     }
 
+    /// Deactivate a scout (admin only).
+    ///
+    /// Sets a `ScoutDeactivated(scout_id)` flag that causes `get_scout_status`
+    /// to return `Deactivated`. The on-chain profile is fully preserved and
+    /// still accessible via `get_scout`.
+    pub fn deactivate_scout(env: Env, scout_id: u64) -> Result<(), ScoutChainError> {
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        // Ensure the scout actually exists before setting the flag.
+        let exists = env.storage().persistent().has(&DataKey::Scout(scout_id));
+        if !exists {
+            return Err(ScoutChainError::ScoutNotFound);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ScoutDeactivated(scout_id), &true);
+        events::scout_deactivated(&env, scout_id, &admin);
+        Ok(())
+    }
+
+    /// Reactivate a previously deactivated scout (admin only).
+    ///
+    /// Clears the `ScoutDeactivated(scout_id)` flag, making the scout
+    /// active again.
+    pub fn reactivate_scout(env: Env, scout_id: u64) -> Result<(), ScoutChainError> {
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        // Ensure the scout actually exists.
+        let exists = env.storage().persistent().has(&DataKey::Scout(scout_id));
+        if !exists {
+            return Err(ScoutChainError::ScoutNotFound);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ScoutDeactivated(scout_id));
+        events::scout_reactivated(&env, scout_id, &admin);
+        Ok(())
+    }
+
     // -------------------------------------------------------------------------
     // Scout registration
     // -------------------------------------------------------------------------
@@ -498,9 +688,7 @@ impl RegistrationContract {
         Self::require_initialized(&env)?;
         wallet.require_auth();
 
-        if region.len() > MAX_REGION_LEN {
-            return Err(ScoutChainError::InvalidInput);
-        }
+        let canon_region = canonicalize_region(&env, &region)?;
 
         // Per-caller cooldown: same pattern as register_player.
         Self::enforce_reg_cooldown(&env, &DataKey::ScoutRegLastSent(wallet.clone()))?;
@@ -518,7 +706,7 @@ impl RegistrationContract {
         let profile = ScoutProfile {
             scout_id,
             wallet: wallet.clone(),
-            region,
+            region: canon_region,
             verified: false,
             verification: ScoutVerificationRecord {
                 verified: false,
@@ -527,7 +715,8 @@ impl RegistrationContract {
                 evidence_ref: None,
                 method: None,
             },
-            registered_at: env.ledger().timestamp(),
+            // Reuse `now` instead of calling env.ledger().timestamp() a second time.
+            registered_at: now,
         };
 
         env.storage()
@@ -541,6 +730,13 @@ impl RegistrationContract {
         env.storage()
             .persistent()
             .set(&DataKey::ScoutByWallet(wallet.clone()), &scout_id);
+        // Extend TTL on ScoutByWallet so scout_access can look up the scout
+        // by wallet even after the key would otherwise be archived.
+        env.storage().persistent().extend_ttl(
+            &DataKey::ScoutByWallet(wallet.clone()),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
 
         // Record cooldown timestamp.
         env.storage()
@@ -579,12 +775,10 @@ impl RegistrationContract {
         if vitals.age == 0 || vitals.age < MIN_PLAYER_AGE {
             return Err(ScoutChainError::InvalidInput);
         }
-        if vitals.position.len() > MAX_STRING_LEN
-            || vitals.region.len() > MAX_REGION_LEN
-            || vitals.nationality.len() > MAX_STRING_LEN
-        {
-            return Err(ScoutChainError::InvalidInput);
-        }
+        let canon_position = canonicalize_position(&env, &vitals.position)?;
+        let canon_region = canonicalize_region(&env, &vitals.region)?;
+        let canon_nationality = canonicalize_nationality(&env, &vitals.nationality)?;
+
         if vitals.age > MAX_PLAYER_AGE {
             return Err(ScoutChainError::InvalidInput);
         }
@@ -595,7 +789,12 @@ impl RegistrationContract {
         let stored = StoredPlayerProfile {
             player_id,
             wallet: wallet.clone(),
-            vitals,
+            vitals: PlayerVitals {
+                age: vitals.age,
+                position: canon_position,
+                region: canon_region,
+                nationality: canon_nationality,
+            },
             ipfs_hashes,
             registered_at,
             updated_at,
@@ -652,14 +851,12 @@ impl RegistrationContract {
             return Err(ScoutChainError::AlreadyRegistered);
         }
 
-        if region.len() > MAX_REGION_LEN {
-            return Err(ScoutChainError::InvalidInput);
-        }
+        let canon_region = canonicalize_region(&env, &region)?;
 
         let profile = ScoutProfile {
             scout_id,
             wallet: wallet.clone(),
-            region,
+            region: canon_region,
             verified,
             verification: ScoutVerificationRecord {
                 verified,
@@ -682,9 +879,21 @@ impl RegistrationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Scout(scout_id), &profile);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Scout(scout_id),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
         env.storage()
             .persistent()
             .set(&DataKey::ScoutByWallet(wallet.clone()), &scout_id);
+        // Extend TTL on ScoutByWallet so scout_access can look up the scout
+        // by wallet even after the key would otherwise be archived.
+        env.storage().persistent().extend_ttl(
+            &DataKey::ScoutByWallet(wallet.clone()),
+            PERSISTENT_TTL_MIN,
+            PERSISTENT_TTL_MAX,
+        );
 
         events::scout_registered(&env, scout_id, &wallet);
         Ok(scout_id)
@@ -737,10 +946,22 @@ impl RegistrationContract {
             return Err(ScoutChainError::InvalidInput);
         }
 
+        // Canonicalize vitals before hashing and storing
+        let canon_position = canonicalize_position(&env, &vitals.position)?;
+        let canon_region = canonicalize_region(&env, &vitals.region)?;
+        let canon_nationality = canonicalize_nationality(&env, &vitals.nationality)?;
+
+        let canon_vitals = PlayerVitals {
+            age: vitals.age,
+            position: canon_position,
+            region: canon_region,
+            nationality: canon_nationality,
+        };
+
         let profile_data_hash = Self::profile_data_hash(
             &env,
             &wallet,
-            &vitals,
+            &canon_vitals,
             &ipfs_hashes,
             player_id,
             registered_at,
@@ -752,8 +973,9 @@ impl RegistrationContract {
 
         let message = Self::migration_message(&env, &authorization);
         let public_key = Self::address_to_ed25519_key(&env, &wallet);
-        // ed25519_verify panics on invalid signature rather than returning bool;
-        // wrap in a check via a no-panic approach — invoke and treat panic as invalid.
+        // The host traps on an invalid signature, failing the invocation so no state persists.
+        // Keep typed role, wallet, expiry, nonce, and hash checks before verification so callers
+        // receive meaningful errors for those cases; a bad signature is the exception.
         env.crypto()
             .ed25519_verify(&public_key, &message, &authorization.signature);
 
@@ -762,7 +984,7 @@ impl RegistrationContract {
         let result = Self::admin_seed_player(
             env.clone(),
             wallet.clone(),
-            vitals,
+            canon_vitals,
             ipfs_hashes,
             level,
             player_id,
@@ -821,13 +1043,19 @@ impl RegistrationContract {
             return Err(ScoutChainError::InvalidInput);
         }
 
-        let region_hash = Self::region_hash(&env, &region);
+        // Canonicalize region before hashing and storing
+        let canon_region = canonicalize_region(&env, &region)?;
+
+        let region_hash = Self::region_hash(&env, &canon_region);
         if authorization.profile_data_hash != region_hash {
             return Err(ScoutChainError::InvalidInput);
         }
 
         let message = Self::migration_message(&env, &authorization);
         let public_key = Self::address_to_ed25519_key(&env, &wallet);
+        // The host traps on an invalid signature, failing the invocation so no state persists.
+        // Keep typed role, wallet, expiry, nonce, and hash checks before verification so callers
+        // receive meaningful errors for those cases; a bad signature is the exception.
         env.crypto()
             .ed25519_verify(&public_key, &message, &authorization.signature);
 
@@ -836,7 +1064,7 @@ impl RegistrationContract {
         let result = Self::admin_seed_scout(
             env.clone(),
             wallet.clone(),
-            region,
+            canon_region,
             scout_id,
             registered_at,
             verified,
@@ -1076,6 +1304,21 @@ impl RegistrationContract {
         }
     }
 
+    /// Check whether a scout has been deactivated by admin.
+    ///
+    /// Returns `true` if the scout exists and has the `ScoutDeactivated` flag set.
+    /// Returns `false` if the scout does not exist or is active.
+    pub fn is_scout_deactivated(env: Env, scout_id: u64) -> bool {
+        let exists = env.storage().persistent().has(&DataKey::Scout(scout_id));
+        if !exists {
+            return false;
+        }
+        env.storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::ScoutDeactivated(scout_id))
+            .unwrap_or(false)
+    }
+
     pub fn get_scout(env: Env, scout_id: u64) -> Result<ScoutProfile, ScoutChainError> {
         let profile: ScoutProfile = env
             .storage()
@@ -1120,6 +1363,11 @@ impl RegistrationContract {
                     .persistent()
                     .get::<DataKey, ScoutProfile>(&DataKey::Scout(id))
                 {
+                    env.storage().persistent().extend_ttl(
+                        &DataKey::Scout(id),
+                        PERSISTENT_TTL_MIN,
+                        PERSISTENT_TTL_MAX,
+                    );
                     profiles.push_back(profile);
                 }
             }
@@ -1247,9 +1495,13 @@ impl RegistrationContract {
     ) -> Result<FilterResult, ScoutChainError> {
         Self::require_initialized(&env)?;
 
+        // Normalize filter inputs to match canonical stored values
+        let canon_region = normalize_filter_region(&env, &region)?;
+        let canon_position = normalize_filter_position(&env, &position)?;
+
         let max_results = limit.min(50);
-        let region_filter = !region.is_empty();
-        let position_filter = !position.is_empty();
+        let region_filter = !canon_region.is_empty();
+        let position_filter = !canon_position.is_empty();
 
         let levels: [ProgressLevel; 4] = [
             ProgressLevel::Unverified,
@@ -1274,7 +1526,7 @@ impl RegistrationContract {
                     .persistent()
                     .get(&DataKey::PlayersByLevelRegion(
                         level.clone(),
-                        region.clone(),
+                        canon_region.clone(),
                     ))
                     .unwrap_or_else(|| Vec::new(&env));
 
@@ -1289,7 +1541,7 @@ impl RegistrationContract {
                         continue;
                     }
                     if let Ok(profile) = Self::load_player(&env, player_id) {
-                        if position_filter && profile.vitals.position != position {
+                        if position_filter && profile.vitals.position != canon_position {
                             continue;
                         }
                         if skipped < offset {
@@ -1326,7 +1578,7 @@ impl RegistrationContract {
                     if !Self::level_gte(&profile.level, &min_level) {
                         continue;
                     }
-                    if position_filter && profile.vitals.position != position {
+                    if position_filter && profile.vitals.position != canon_position {
                         continue;
                     }
                     if skipped < offset {
@@ -3078,6 +3330,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_set_player_level_emits_event_with_level() {
+        use soroban_sdk::testutils::Events;
+        use soroban_sdk::IntoVal;
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        // Register a player
+        let wallet = Address::generate(&env);
+        let hashes = vec![&env, String::from_str(&env, "QmPK1s3pNYLi9ERiq3BDxKa4XosgWwFRQUydHUtz4YgpqB")];
+        let player_id = client.register_player(&wallet, &dummy_vitals(&env), &hashes);
+
+        // Wire a progress contract
+        let progress_contract = Address::generate(&env);
+        client.set_progress_contract(&progress_contract);
+
+        // Clear events so far
+        let _ = env.events().all();
+
+        // Call set_player_level
+        client.set_player_level(&player_id, &ProgressLevel::VerifiedIdentity);
+
+        // Verify the event data includes both player_id and the new level
+        let events = env.events().all();
+        assert_eq!(
+            events,
+            soroban_sdk::vec![
+                &env,
+                (
+                    client.address.clone(),
+                    (
+                        soroban_sdk::Symbol::new(&env, "player_level_synced"),
+                        progress_contract.clone(),
+                    )
+                        .into_val(&env),
+                    (player_id, ProgressLevel::VerifiedIdentity).into_val(&env)
+                )
+            ]
+        );
+    }
+
     // -------------------------------------------------------------------------
     // Issue #32: Scout verified flag and verify_scout admin function
     // -------------------------------------------------------------------------
@@ -3655,9 +3949,47 @@ mod tests {
         assert_eq!(profile.level, ProgressLevel::Unverified);
     }
 
+    #[test]
+    fn test_get_scouts_extends_persistent_ttl() {
+        use soroban_sdk::testutils::{storage::Persistent as _, Ledger};
+
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number = 100;
+            ledger.max_entry_ttl = PERSISTENT_TTL_MAX + 1;
+        });
+
+        let wallet = Address::generate(&env);
+        let region = String::from_str(&env, "Europe");
+        let scout_id = client.register_scout(&wallet, &region);
+
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number = 100 + 4_000;
+        });
+
+        let scout_key = DataKey::Scout(scout_id);
+        let ttl_before = env.as_contract(&client.address, || {
+            env.storage().persistent().get_ttl(&scout_key)
+        });
+        assert!(ttl_before < PERSISTENT_TTL_MIN);
+
+        let profiles = client.get_scouts(&vec![&env, scout_id]);
+        assert_eq!(profiles.len(), 1);
+
+        let ttl_after = env.as_contract(&client.address, || {
+            env.storage().persistent().get_ttl(&scout_key)
+        });
+        assert!(ttl_after > ttl_before);
+    }
+
     // -------------------------------------------------------------------------
+
     // Issue #444: register_player age field must reject implausible upper values
     // -------------------------------------------------------------------------
+
 
     /// An age of MAX_PLAYER_AGE (100) must be accepted.
     #[test]
@@ -3848,5 +4180,85 @@ mod tests {
         let record = client.get_scout_verification(&scout_id);
         assert!(record.verified);
         assert!(record.verified_by.is_some());
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #1440: ScoutByWallet TTL extended and single timestamp read
+    // -------------------------------------------------------------------------
+
+    /// register_scout must extend the TTL on ScoutByWallet so scout_access can
+    /// look up the scout by wallet even after the Scout entry's TTL window would
+    /// otherwise have archived the index key.
+    ///
+    /// Also verifies that `registered_at` equals the value captured before the
+    /// profile is built (i.e., `now` is reused rather than calling
+    /// `env.ledger().timestamp()` a second time).
+    #[test]
+    fn test_register_scout_extends_scout_by_wallet_ttl() {
+        use soroban_sdk::testutils::Ledger;
+
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+            l.timestamp = 1_000_000;
+            l.max_entry_ttl = 1_000_000;
+        });
+
+        let wallet = Address::generate(&env);
+        let region = String::from_str(&env, "West Africa");
+        let scout_id = client.register_scout(&wallet, &region);
+
+        // Advance past the PERSISTENT_TTL_MAX to confirm the key was extended.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100 + PERSISTENT_TTL_MAX + 1;
+        });
+
+        // get_scout_by_wallet should still succeed because ScoutByWallet TTL was extended.
+        let fetched = client.get_scout_by_wallet(&wallet);
+        assert_eq!(fetched.scout_id, scout_id);
+
+        // registered_at must match the timestamp that was current when
+        // register_scout was called (no double-read).
+        let scout = client.get_scout(&scout_id);
+        assert_eq!(scout.registered_at, 1_000_000u64);
+    }
+
+    /// admin_seed_scout must extend the TTL on both Scout and ScoutByWallet.
+    #[test]
+    fn test_admin_seed_scout_extends_both_ttls() {
+        use soroban_sdk::testutils::Ledger;
+
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100;
+            l.max_entry_ttl = 1_000_000;
+        });
+
+        let wallet = Address::generate(&env);
+        let scout_id = client.admin_seed_scout(
+            &wallet,
+            &String::from_str(&env, "Europe"),
+            &42u64,
+            &999u64,
+            &false,
+        );
+
+        // Advance the ledger past the default Soroban TTL.
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 100 + PERSISTENT_TTL_MAX + 1;
+        });
+
+        // Both lookups must still succeed.
+        let scout = client.get_scout(&scout_id);
+        assert_eq!(scout.wallet, wallet);
+
+        let fetched = client.get_scout_by_wallet(&wallet);
+        assert_eq!(fetched.scout_id, scout_id);
     }
 }

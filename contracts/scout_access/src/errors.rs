@@ -92,7 +92,7 @@ pub enum ScoutAccessError {
     /// Registration contract is not wired; Pro/Elite subscriptions require it.
     RegistrationContractNotSet = 28,
     /// batch_contact_players input exceeds the maximum allowed batch size.
-    BatchTooLarge = 29,
+    BatchTooLarge = 40,
 
     // ── Auto-renewal ──
     /// `renew_if_due` was called but auto-renewal is not enabled for this scout.
@@ -138,6 +138,11 @@ pub enum ScoutAccessError {
     /// `admin_revoke_evidence_access` targeted a (player_id, scout) pair for
     /// which no `EvidenceAccessGrant` record exists.
     GrantNotFound = 38,
+
+    // ── Scout deactivation ──
+    /// The scout has been deactivated by the registration admin and cannot
+    /// use paid services (subscribe, pay_to_contact, log_trial_offer).
+    ScoutDeactivated = 39,
 }
 
 impl AdminError for ScoutAccessError {
@@ -211,5 +216,10 @@ mod tests {
     #[test]
     fn grant_not_found_is_code_38() {
         assert_eq!(ScoutAccessError::GrantNotFound as u32, 38);
+    }
+
+    #[test]
+    fn scout_deactivated_is_code_39() {
+        assert_eq!(ScoutAccessError::ScoutDeactivated as u32, 39);
     }
 }
