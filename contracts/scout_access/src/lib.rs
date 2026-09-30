@@ -1036,7 +1036,7 @@ impl ScoutAccessContract {
     /// 3. Write contact record to persistent storage (prevents duplicate contacts).
     ///
     /// Scout must have an active, non-expired subscription.
-    /// Pro tier scouts are limited to `pro_contact_limit` contacts per month.
+    /// Pro tier scouts are limited to `pro_contact_limit` contacts per subscription period; the count resets when the subscription renews.
     pub fn pay_to_contact(
         env: Env,
         scout: Address,
@@ -1185,7 +1185,7 @@ impl ScoutAccessContract {
     /// that were recorded.
     ///
     /// Scout must have an active (non-expired) subscription.
-    /// Pro tier scouts are limited to `pro_contact_limit` contacts per month.
+    /// Pro tier scouts are limited to `pro_contact_limit` contacts per subscription period; the count resets when the subscription renews.
     pub fn batch_contact_players(
         env: Env,
         scout: Address,

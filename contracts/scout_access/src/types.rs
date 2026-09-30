@@ -131,7 +131,7 @@ pub struct FeeConfig {
     /// Trial offer expiry window in seconds.
     /// Must be > 0; defines how long an escrowed trial offer remains valid.
     pub trial_offer_expiry_secs: u64,
-    /// Maximum contacts per month for Pro tier (default: 10)
+    /// Maximum contacts per subscription period for Pro tier (default: 10). Resets on renewal.
     /// Elite-tier scouts are exempt from this cap (no limit applies).
     /// See `docs/CONTRACT_REFERENCE.md` — `FeeConfig` and `ProContactLimitReached`
     /// (error 20) for the full per-tier access semantics, and `docs/GLOSSARY.md`
