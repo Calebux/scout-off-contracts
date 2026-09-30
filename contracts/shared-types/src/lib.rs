@@ -194,6 +194,13 @@ where
 /// This does not perform admin authorization itself — callers must call
 /// [`require_admin`] (or otherwise authorize the caller) before invoking
 /// this.
+///
+/// # Overflow policy
+///
+/// The epoch is a `u32` incremented with [`u32::saturating_add`]. With
+/// `overflow-checks = true` in the release profile, a plain `epoch + 1` would
+/// **trap** on the 4,294,967,296th re-wiring. `saturating_add` saturates at
+/// `u32::MAX` rather than trapping.
 pub fn write_wiring_link<K>(env: &Env, addr_key: &K, epoch_key: &K, addr: &Address) -> u32
 where
     K: IntoVal<Env, soroban_sdk::Val>,
@@ -203,7 +210,7 @@ where
         .instance()
         .get::<K, u32>(epoch_key)
         .unwrap_or(0)
-        + 1;
+        .saturating_add(1);
     env.storage().instance().set(addr_key, addr);
     env.storage().instance().set(epoch_key, &next_epoch);
     next_epoch
@@ -626,6 +633,60 @@ mod tests {
 
     fn s(env: &Env, v: &str) -> String {
         String::from_str(env, v)
+    }
+
+    // ── write_wiring_link tests (#1466) ───────────────────────────────────────
+
+    /// First wiring: epoch starts at 0, advances to 1.
+    #[test]
+    fn test_write_wiring_link_first_call_sets_epoch_to_one() {
+        let env = Env::default();
+        let addr = Address::generate(&env);
+
+        write_wiring_link(&env, &1u32, &2u32, &addr);
+
+        let stored_addr: Address = env.storage().instance().get(&1u32).unwrap();
+        let stored_epoch: u32 = env.storage().instance().get(&2u32).unwrap();
+
+        assert_eq!(stored_addr, addr);
+        assert_eq!(stored_epoch, 1u32);
+    }
+
+    /// Re-wiring increments the epoch and updates the address.
+    #[test]
+    fn test_write_wiring_link_increments_epoch_on_rewiring() {
+        let env = Env::default();
+        let addr1 = Address::generate(&env);
+        let addr2 = Address::generate(&env);
+
+        write_wiring_link(&env, &1u32, &2u32, &addr1);
+        write_wiring_link(&env, &1u32, &2u32, &addr2);
+
+        let stored_addr: Address = env.storage().instance().get(&1u32).unwrap();
+        let stored_epoch: u32 = env.storage().instance().get(&2u32).unwrap();
+
+        assert_eq!(stored_addr, addr2);
+        assert_eq!(stored_epoch, 2u32);
+    }
+
+    /// Boundary: epoch at u32::MAX must saturate, not trap (issue #1466).
+    #[test]
+    fn test_write_wiring_link_saturates_at_u32_max_epoch() {
+        let env = Env::default();
+
+        // Seed the epoch key at u32::MAX.
+        env.storage().instance().set(&2u32, &u32::MAX);
+
+        let addr = Address::generate(&env);
+        // saturating_add(1) keeps epoch at u32::MAX — must not trap.
+        write_wiring_link(&env, &1u32, &2u32, &addr);
+
+        let stored_epoch: u32 = env.storage().instance().get(&2u32).unwrap();
+        assert_eq!(stored_epoch, u32::MAX,
+            "epoch must saturate at u32::MAX, not overflow or trap");
+        let stored_addr: Address = env.storage().instance().get(&1u32).unwrap();
+        assert_eq!(stored_addr, addr,
+            "address must still be updated at boundary epoch");
     }
 
     #[test]
