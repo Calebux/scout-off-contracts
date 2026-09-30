@@ -550,6 +550,7 @@ pub struct U64Page {
     pub total: u32,
 }
 
+/// Lightweight syntactic validation for IPFS CIDs used as evidence and media references.
 ///
 /// Accepted forms:
 /// - **CIDv0**: starts with `"Qm"`, exactly 46 characters, base58btc charset
@@ -568,6 +569,13 @@ pub struct U64Page {
 /// to catch obviously wrong input (wrong prefix, wrong length, or bytes outside
 /// the expected alphabet — e.g. whitespace or control characters), not
 /// guarantee byte-for-byte correctness.
+///
+/// # Errors
+///
+/// Returns `Err(&'static str)` with a human-readable message describing the
+/// validation failure. These messages are intended for tests and debugging;
+/// callers should map them to the appropriate contract error variant (e.g.
+/// `InvalidInput`) rather than surfacing the raw string to end users.
 pub fn validate_cid(hash: &String) -> Result<(), &'static str> {
     let hash_len = hash.len();
     let bytes = hash.to_bytes();
